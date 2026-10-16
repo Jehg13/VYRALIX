@@ -1,0 +1,20 @@
+{
+  "name": "vyralix",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n API,WEB -c magenta,cyan \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "npm run dev --workspace @vyralix/api",
+    "dev:web": "npm run dev --workspace @vyralix/web",
+    "build": "npm run build --workspace @vyralix/web",
+    "test": "npm test --workspace @vyralix/api",
+    "start": "npm run start --workspace @vyralix/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
