@@ -5,7 +5,7 @@ import { execFile, spawn } from 'node:child_process';
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
-import { buildSrt, createScenePlan, projectFromRow, sceneSchema } from './scene-planner.js';
+import { buildSrt, buildSubtitleAss, createScenePlan, projectFromRow, sceneSchema } from './scene-planner.js';
 import { detectFfmpeg, ffmpegPath, ffprobePath } from './ffmpeg.js';
 import {
   buildScenePlanningPrompt,
@@ -19,13 +19,36 @@ import {
 } from './ai-scene-planner.js';
 import { ProviderError, safeProviderError } from '../ai/provider-error.js';
 import { createWindowsSpeechEngine } from './voice-engine.js';
+import { allocateSceneDurations, getRequiredVoiceSceneDuration, getSceneTiming } from './scene-timing.js';
+import { isValidPng } from './image-validation.js';
 
 const projectIdSchema = z.string().uuid();
+const visualReviewSchema = z.object({
+  status: z.enum(['approved', 'needs_changes']),
+  note: z.string().trim().max(1000).optional(),
+}).strict();
 const execFileAsync = promisify(execFile);
 const assetIdSchema = z.string().uuid();
 const projectCreateSchema = z.object({
   postId: projectIdSchema,
   durationSeconds: z.coerce.number().int().min(5).max(180).default(30),
+});
+const researchPlanSchema = z.object({
+  centralIdea: z.string().min(1),
+  durationSeconds: z.number().int().min(15).max(180),
+  scenes: z.array(z.object({
+    order: z.number().int().min(1).max(12),
+    durationSeconds: z.number().int().min(1).max(180),
+    voiceover: z.string().min(1).max(900),
+    visualProposal: z.string().min(1).max(500),
+  })).min(1).max(12),
+}).superRefine((proposal, context) => {
+  if (proposal.scenes.some((scene, index) => scene.order !== index + 1)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['scenes'], message: 'El orden de escenas no es consecutivo.' });
+  }
+  if (proposal.scenes.reduce((sum, scene) => sum + scene.durationSeconds, 0) !== proposal.durationSeconds) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['scenes'], message: 'La duración de las escenas no coincide con la propuesta.' });
+  }
 });
 const projectUpdateSchema = z.object({
   durationSeconds: z.number().int().min(5).max(180).optional(),
@@ -234,6 +257,9 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
   const maxUploadBytes = Math.max(1024 * 1024, Math.min(Number(process.env.MEDIA_MAX_UPLOAD_BYTES) || 250 * 1024 * 1024, 1024 * 1024 * 1024));
   const timeoutMs = Math.max(60_000, Math.min(Number(process.env.MEDIA_RENDER_TIMEOUT_MS) || 30 * 60_000, 4 * 60 * 60_000));
   const maxConcurrent = Math.max(1, Math.min(Number(process.env.MEDIA_MAX_CONCURRENT) || 1, 2));
+  const voiceSceneMarginSeconds = process.env.MEDIA_VOICE_SCENE_MARGIN_SECONDS === undefined
+    ? 0.5
+    : z.coerce.number().finite().min(0).max(3).parse(process.env.MEDIA_VOICE_SCENE_MARGIN_SECONDS);
   const running = new Map();
   const activeTasks = new Map();
   const activeVoiceControllers = new Map();
@@ -299,13 +325,93 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
         const generations = database.prepare(`SELECT * FROM media_scene_voice_generations
           WHERE scene_id = ? ORDER BY created_at DESC LIMIT 20`).all(scene.id);
         const active = generations.find((generation) => generation.is_active === 1) || null;
+        const voiceAudio = voiceGenerationJson(active, scene.voiceText);
+        const voiceMatchesText = active?.status === 'completed' && !voiceAudio.stale;
+        const voiceDurationUnavailable = voiceMatchesText &&
+          (!Number.isFinite(active.duration_seconds) || active.duration_seconds <= 0);
         return {
           ...scene,
-          voiceAudio: voiceGenerationJson(active, scene.voiceText),
+          voiceAudio,
           voiceGeneration: voiceGenerationJson(generations[0] || null, scene.voiceText),
+          voiceTiming: getSceneTiming({
+            plannedDurationSeconds: scene.plannedDurationSeconds,
+            currentDurationSeconds: scene.durationSeconds,
+            voiceDurationSeconds: voiceMatchesText ? active.duration_seconds : null,
+            marginSeconds: voiceSceneMarginSeconds,
+            durationSource: scene.durationSource,
+          }),
+          voiceDurationUnavailable,
         };
       }),
+      voiceTimingSummary: (() => {
+        const requiredTotal = project.scenes.reduce((sum, scene) => {
+          const active = database.prepare(`SELECT duration_seconds, source_sha256 FROM media_scene_voice_generations
+            WHERE scene_id = ? AND is_active = 1 AND status = 'completed'`).get(scene.id);
+          const duration = active && active.source_sha256 === createHash('sha256').update(scene.voiceText).digest('hex')
+            ? getRequiredVoiceSceneDuration(active.duration_seconds, voiceSceneMarginSeconds)
+            : null;
+          return sum + Math.max(scene.plannedDurationSeconds, duration || scene.plannedDurationSeconds);
+        }, 0);
+        return {
+          marginSeconds: voiceSceneMarginSeconds,
+          requiredDurationSeconds: requiredTotal,
+          projectLimitSeconds: 180,
+          exceedsProjectLimit: requiredTotal > 180,
+          confirmedVoiceScenes: project.scenes.filter((scene) => {
+            const active = database.prepare(`SELECT source_sha256, duration_seconds FROM media_scene_voice_generations
+              WHERE scene_id = ? AND is_active = 1 AND status = 'completed'`).get(scene.id);
+            return active?.source_sha256 === createHash('sha256').update(scene.voiceText).digest('hex') &&
+              Number.isFinite(active.duration_seconds) && active.duration_seconds > 0;
+          }).length,
+        };
+      })(),
     };
+  }
+
+  function recalculateVoiceTimings(projectId, updatedAt) {
+    const rows = database.prepare(`SELECT s.id, s.duration_seconds, s.planned_duration_seconds, s.duration_source,
+        s.voice_text, g.duration_seconds AS voice_duration_seconds, g.source_sha256
+      FROM media_scenes s
+      LEFT JOIN media_scene_voice_generations g
+        ON g.scene_id = s.id AND g.is_active = 1 AND g.status = 'completed'
+      WHERE s.project_id = ? ORDER BY s.scene_order`).all(projectId);
+    const scenes = rows.map((row) => {
+      const voiceDurationSeconds = row.source_sha256 === createHash('sha256').update(row.voice_text).digest('hex')
+        ? row.voice_duration_seconds
+        : null;
+      return {
+        ...row,
+        plannedDurationSeconds: row.planned_duration_seconds,
+        durationSource: row.duration_source,
+        timing: getSceneTiming({
+          plannedDurationSeconds: row.planned_duration_seconds,
+          currentDurationSeconds: row.duration_seconds,
+          voiceDurationSeconds,
+          marginSeconds: voiceSceneMarginSeconds,
+          durationSource: row.duration_source,
+        }),
+      };
+    });
+    const targets = allocateSceneDurations(scenes.map((scene) => ({
+      plannedDurationSeconds: scene.plannedDurationSeconds,
+      targetDurationSeconds: scene.timing.targetDurationSeconds,
+    })), 180);
+    const total = targets.reduce((sum, duration) => sum + duration, 0);
+    const transaction = database.transaction(() => {
+      const update = database.prepare(`UPDATE media_scenes SET duration_seconds = ?,
+        planned_duration_seconds = ?, duration_source = ?, updated_at = ? WHERE id = ?`);
+      scenes.forEach((scene, index) => update.run(
+        targets[index],
+        scene.plannedDurationSeconds,
+        scene.durationSource,
+        updatedAt,
+        scene.id,
+      ));
+      database.prepare(`UPDATE media_projects SET duration_seconds = ?, status = 'draft', updated_at = ? WHERE id = ?`)
+        .run(total, updatedAt, projectId);
+    });
+    transaction();
+    return { durationSeconds: total, exceedsProjectLimit: scenes.some((scene, index) => targets[index] < scene.timing.targetDurationSeconds) };
   }
 
   async function availableVoiceProviders() {
@@ -350,7 +456,14 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     return {
       ffmpeg,
       voiceProviders: await availableVoiceProviders(),
-      limits: { maxUploadBytes, maxConcurrent, maxDurationSeconds: 180, defaultWidth: 720, defaultHeight: 1280 },
+      limits: {
+        maxUploadBytes,
+        maxConcurrent,
+        maxDurationSeconds: 180,
+        defaultWidth: 720,
+        defaultHeight: 1280,
+        voiceSceneMarginSeconds,
+      },
       counts: { assets: assetCount, projects: projectCount, activeJobs },
       storage: { mediaDirectory: 'data/media', exportsDirectory: 'data/media/exports' },
     };
@@ -435,6 +548,47 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     }
   }
 
+  async function saveGeneratedImage(buffer, providerName, model) {
+    if (!isValidPng(buffer)) {
+      throw Object.assign(new Error('El contenido generado no es un PNG válido.'), { status: 415 });
+    }
+    if (buffer.length > maxUploadBytes) {
+      throw Object.assign(new Error(`La imagen generada excede el límite de ${Math.round(maxUploadBytes / 1024 / 1024)} MiB configurado para la biblioteca.`), { status: 413 });
+    }
+    const id = randomUUID();
+    const name = `gemini-${id}.png`;
+    const temporaryPath = join(temporaryDirectory, `${id}.generated`);
+    const outputPath = join(assetsDirectory, `${id}.png`);
+    const digest = createHash('sha256').update(buffer).digest('hex');
+    const duplicate = database.prepare('SELECT * FROM media_assets WHERE sha256 = ?').get(digest);
+    if (duplicate) return { asset: getAssetMetadata(duplicate.id), duplicate: true };
+
+    await writeFile(temporaryPath, buffer, { flag: 'wx', mode: 0o600 });
+    try {
+      await rename(temporaryPath, outputPath);
+      const transaction = database.transaction(() => {
+        database.prepare(`INSERT INTO media_assets
+          (id, kind, original_name, relative_path, mime_type, size_bytes, sha256, provenance, license, created_at)
+          VALUES (?, 'image', ?, ?, 'image/png', ?, ?, ?, ?, ?)`).run(
+          id, name, `assets/${id}.png`, buffer.length, digest,
+          `Generada mediante ${providerName}`, `Imagen generada con ${model}; términos de uso por verificar`, timestamp(),
+        );
+      });
+      try {
+        transaction();
+      } catch (error) {
+        await rm(outputPath, { force: true });
+        throw error;
+      }
+    } catch (error) {
+      await rm(temporaryPath, { force: true }).catch(() => {});
+      throw error;
+    }
+    const asset = getAssetMetadata(id);
+    void enrichAssetMetadata(id);
+    return { asset, duplicate: false };
+  }
+
   async function enrichAssetMetadata(id) {
     const asset = getAsset(id);
     if (!asset) return;
@@ -468,12 +622,45 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     const existing = getProjectJson(database.prepare('SELECT id FROM media_projects WHERE post_id = ?').get(post.id)?.id);
     if (existing) return res.status(200).json({ project: existing, existing: true });
     const projectId = randomUUID();
-    const plan = createScenePlan({
-      title: post.title,
-      category: post.category,
-      script: post.body || post.title,
-      durationSeconds: parsed.data.durationSeconds,
-    });
+    const researchRow = database.prepare(`SELECT proposal_json FROM research_sessions
+      WHERE media_post_id = ? AND proposal_status = 'sent_to_media'`).get(post.id);
+    let plan;
+    if (researchRow) {
+      let proposal;
+      try {
+        proposal = JSON.parse(researchRow.proposal_json);
+      } catch {
+        return res.status(409).json({ error: 'La propuesta vinculada no se puede leer; no se modificó el proyecto.' });
+      }
+      const validated = researchPlanSchema.safeParse(proposal);
+      if (!validated.success) return res.status(409).json({ error: 'La propuesta vinculada tiene escenas inválidas; no se modificó el proyecto.' });
+      plan = {
+        title: post.title,
+        category: post.category,
+        narrativeGoal: validated.data.centralIdea.slice(0, 500),
+        durationSeconds: validated.data.durationSeconds,
+        sourceScript: (post.body || post.title).slice(0, 5000),
+        scenes: validated.data.scenes.map((scene, index) => ({
+          order: index,
+          durationSeconds: scene.durationSeconds,
+          voiceText: scene.voiceover,
+          subtitleText: scene.voiceover,
+          visualDescription: scene.visualProposal,
+          visualType: 'image',
+          movement: '',
+          transition: index === 0 ? 'cut' : 'fade',
+          onScreenText: '',
+          visualPrompt: scene.visualProposal,
+        })),
+      };
+    } else {
+      plan = createScenePlan({
+        title: post.title,
+        category: post.category,
+        script: post.body || post.title,
+        durationSeconds: parsed.data.durationSeconds,
+      });
+    }
     const timestampValue = timestamp();
     const transaction = database.transaction(() => {
       database.prepare(`INSERT INTO media_projects
@@ -483,14 +670,22 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
         plan.durationSeconds, timestampValue, timestampValue,
       );
       const addScene = database.prepare(`INSERT INTO media_scenes
-        (id, project_id, scene_order, duration_seconds, voice_text, subtitle_text, visual_description,
+        (id, project_id, scene_order, duration_seconds, planned_duration_seconds, duration_source, voice_text, subtitle_text, visual_description,
          visual_type, movement, transition, on_screen_text, visual_prompt, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-      for (const scene of plan.scenes) addScene.run(
-        randomUUID(), projectId, scene.order, scene.durationSeconds, scene.voiceText, scene.subtitleText,
+        VALUES (?, ?, ?, ?, ?, 'estimated', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      const addSceneDetails = database.prepare(`INSERT INTO media_scene_details
+        (scene_id, title, narrative_goal, dialogue, shot_type, camera_movement, action_description,
+         environment, lighting, palette, continuity_before, continuity_after, audio_notes, visual_pending)
+        VALUES (?, ?, ?, '', '', '', '', '', '', '', '', '', '', ?)`);
+      for (const scene of plan.scenes) {
+        const sceneId = randomUUID();
+        addScene.run(
+        sceneId, projectId, scene.order, scene.durationSeconds, scene.durationSeconds, scene.voiceText, scene.subtitleText,
         scene.visualDescription, scene.visualType, scene.movement, scene.transition,
         scene.onScreenText, scene.visualPrompt, timestampValue, timestampValue,
-      );
+        );
+        if (researchRow) addSceneDetails.run(sceneId, `Escena ${scene.order + 1}`, plan.narrativeGoal, 1);
+      }
     });
     transaction();
     return res.status(201).json({ project: getProjectJson(projectId), existing: false });
@@ -514,9 +709,13 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     }
     const scenes = database.prepare('SELECT * FROM media_scenes WHERE project_id = ? ORDER BY scene_order').all(id);
     if (value.durationSeconds !== undefined) {
-      const durations = scaleDurations(scenes, value.durationSeconds);
-      const updateDuration = database.prepare('UPDATE media_scenes SET duration_seconds = ?, updated_at = ? WHERE id = ?');
-      scenes.forEach((scene, index) => updateDuration.run(durations[index], timestamp(), scene.id));
+      const durations = scaleDurations(scenes.map((scene) => ({
+        ...scene,
+        duration_seconds: scene.planned_duration_seconds,
+      })), value.durationSeconds);
+      const updateDuration = database.prepare(`UPDATE media_scenes SET duration_seconds = ?,
+        planned_duration_seconds = ?, duration_source = 'manual', updated_at = ? WHERE id = ?`);
+      scenes.forEach((scene, index) => updateDuration.run(durations[index], durations[index], timestamp(), scene.id));
     }
     const fields = {
       duration_seconds: value.durationSeconds,
@@ -533,6 +732,7 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       database.prepare(`UPDATE media_projects SET ${updates.map(([field]) => `${field} = ?`).join(', ')}, updated_at = ? WHERE id = ?`)
         .run(...updates.map(([, item]) => item), timestamp(), id);
     }
+    if (value.durationSeconds !== undefined) recalculateVoiceTimings(id, timestamp());
     database.prepare(`UPDATE media_projects SET status = 'draft', updated_at = ? WHERE id = ? AND status IN ('failed', 'completed')`)
       .run(timestamp(), id);
     return res.json({ project: getProjectJson(id) });
@@ -553,7 +753,6 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     }
     const fields = {
       scene_order: value.order,
-      duration_seconds: value.durationSeconds,
       voice_text: value.voiceText,
       subtitle_text: value.subtitleText,
       visual_description: value.visualDescription,
@@ -580,10 +779,24 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     };
     const updates = Object.entries(fields).filter(([, item]) => item !== undefined);
     const detailUpdates = Object.entries(detailFields).filter(([, item]) => item !== undefined);
+    const durationChanged = value.durationSeconds !== undefined && value.durationSeconds !== scene.duration_seconds;
+    const plannedDuration = durationChanged ? value.durationSeconds : scene.planned_duration_seconds;
+    if (durationChanged) {
+      const plannedTotal = database.prepare(`SELECT SUM(planned_duration_seconds) AS total
+        FROM media_scenes WHERE project_id = ?`).get(scene.project_id).total;
+      const nextPlannedTotal = plannedTotal - scene.planned_duration_seconds + plannedDuration;
+      if (nextPlannedTotal < 5 || nextPlannedTotal > 180) {
+        return res.status(400).json({ error: 'La duración base total del proyecto debe mantenerse entre 5 y 180 segundos.' });
+      }
+    }
     const timestampValue = timestamp();
     const transaction = database.transaction(() => {
       if (updates.length) database.prepare(`UPDATE media_scenes SET ${updates.map(([field]) => `${field} = ?`).join(', ')}, updated_at = ? WHERE id = ?`)
         .run(...updates.map(([, item]) => item), timestampValue, sceneId);
+      if (durationChanged) {
+        database.prepare(`UPDATE media_scenes SET planned_duration_seconds = ?, duration_source = 'manual'
+          WHERE id = ?`).run(plannedDuration, sceneId);
+      }
       if (detailUpdates.length || value.assetId !== undefined) {
         const existingDetails = database.prepare('SELECT * FROM media_scene_details WHERE scene_id = ?').get(sceneId);
         const details = {
@@ -616,10 +829,6 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
             details.camera_movement, details.action_description, details.environment, details.lighting,
             details.palette, details.continuity_before, details.continuity_after, details.audio_notes, details.visual_pending);
       }
-      const total = database.prepare('SELECT SUM(duration_seconds) AS total FROM media_scenes WHERE project_id = ?').get(scene.project_id).total;
-      if (!Number.isInteger(total) || total < 5 || total > 180) throw Object.assign(new Error('La suma de las escenas debe estar entre 5 y 180 segundos.'), { status: 400 });
-      database.prepare(`UPDATE media_projects SET duration_seconds = ?, status = 'draft', updated_at = ? WHERE id = ?`)
-        .run(total, timestampValue, scene.project_id);
     });
     try {
       transaction();
@@ -630,10 +839,12 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       }
       throw error;
     }
+    recalculateVoiceTimings(scene.project_id, timestampValue);
     return res.json({ project: getProjectJson(scene.project_id) });
   }
 
   function planErrorStatus(code) {
+    if (code === 'external_operations_disabled') return 423;
     if (code === 'no_provider') return 503;
     if (code === 'script_too_long') return 422;
     if (code === 'project_rendering') return 409;
@@ -785,9 +996,10 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     const transaction = database.transaction(() => {
       database.prepare('DELETE FROM media_scenes WHERE project_id = ?').run(projectId);
       const insertScene = database.prepare(`INSERT INTO media_scenes
-        (id, project_id, scene_order, duration_seconds, voice_text, subtitle_text, visual_description,
-         visual_type, movement, transition, on_screen_text, visual_prompt, asset_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+        (id, project_id, scene_order, duration_seconds, planned_duration_seconds, duration_source,
+         voice_text, subtitle_text, visual_description, visual_type, movement, transition,
+         on_screen_text, visual_prompt, asset_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'estimated', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
       const insertDetails = database.prepare(`INSERT INTO media_scene_details
         (scene_id, title, narrative_goal, dialogue, shot_type, camera_movement, action_description,
          environment, lighting, palette, continuity_before, continuity_after, audio_notes, visual_pending)
@@ -796,7 +1008,7 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
         const previous = preserveAssets ? assetsByOrder.get(scene.order) : null;
         const assetId = previous?.asset_id || null;
         insertScene.run(
-          scene.id, projectId, scene.order, scene.durationSeconds, scene.voiceText,
+          scene.id, projectId, scene.order, scene.durationSeconds, scene.durationSeconds, scene.voiceText,
           scene.subtitleText, scene.visualDescription, assetId ? previous.visual_type : 'composition',
           scene.cameraMovement, scene.transition, scene.onScreenText, scene.visualDescription,
           assetId, now, now,
@@ -825,6 +1037,7 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       }
       throw error;
     }
+    recalculateVoiceTimings(projectId, now);
     return res.json({ project: getProjectJson(projectId) });
   }
 
@@ -949,6 +1162,7 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
             .run(`voices/${generationId}.wav`, duration, sampleRate, channels, stats.size, completedAt, completedAt, generationId);
         });
         transaction();
+        recalculateVoiceTimings(generation.project_id, completedAt);
       } catch (error) {
         const cancelled = controller.signal.aborted || error?.code === 'cancelled';
         const status = cancelled ? 'cancelled' : 'failed';
@@ -1036,8 +1250,13 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     if (generation.status !== 'completed' || !generation.is_active) {
       return res.status(409).json({ error: 'Solo puedes desvincular el audio activo de la escena.' });
     }
+    const project = getProject(generation.project_id);
+    if (project.status === 'rendering') {
+      return res.status(409).json({ error: 'No se puede desvincular narración mientras el proyecto se está renderizando.' });
+    }
     database.prepare('UPDATE media_scene_voice_generations SET is_active = 0, updated_at = ? WHERE id = ?')
       .run(timestamp(), generationId);
+    recalculateVoiceTimings(generation.project_id, timestamp());
     return res.json({ project: getProjectJson(generation.project_id) });
   }
 
@@ -1046,6 +1265,11 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     if (!row) throw Object.assign(new Error('No se encontró el proyecto.'), { status: 404 });
     const project = projectFromRow(row, database);
     if (!project.scenes.length) throw Object.assign(new Error('El proyecto no tiene escenas.'), { status: 409 });
+    const researchLinked = database.prepare(`SELECT 1 FROM research_sessions
+      WHERE media_post_id = ? AND proposal_status = 'sent_to_media'`).get(row.post_id);
+    if (researchLinked && project.scenes.some((scene) => !scene.asset)) {
+      throw Object.assign(new Error('La propuesta de investigación no tiene recursos visuales asignados en todas sus escenas. Asigna imágenes o clips antes de renderizar.'), { status: 409 });
+    }
     const scenes = project.scenes.map((scene) => {
       const asset = scene.asset ? getAsset(scene.asset.id) : null;
       if (scene.asset && (!asset || !existsSync(assetPath(asset)))) {
@@ -1056,6 +1280,9 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       const staleVoice = activeVoice && activeVoice.source_sha256 !== createHash('sha256').update(scene.voiceText).digest('hex');
       if (staleVoice) {
         throw Object.assign(new Error(`El audio de narración de la escena ${scene.order + 1} está desactualizado. Regénéralo o desvincúlalo antes de renderizar.`), { status: 409 });
+      }
+      if (activeVoice && (!Number.isFinite(activeVoice.duration_seconds) || activeVoice.duration_seconds <= 0)) {
+        throw Object.assign(new Error(`FFprobe no confirmó la duración del WAV de la escena ${scene.order + 1}. Regenera o desvincula esta narración antes de renderizar.`), { status: 409 });
       }
       if (activeVoice && (!activeVoice.relative_path || !existsSync(safeRelativePath(mediaRoot, activeVoice.relative_path)))) {
         throw Object.assign(new Error(`No se encuentra el audio de narración de la escena ${scene.order + 1}. Regénéralo o desvincúlalo.`), { status: 409 });
@@ -1071,6 +1298,9 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
         assetKind: asset?.kind || null,
         voicePath: activeVoice ? safeRelativePath(mediaRoot, activeVoice.relative_path) : null,
         voiceDurationSeconds: activeVoice?.duration_seconds || null,
+        voiceRequiredDurationSeconds: activeVoice
+          ? getRequiredVoiceSceneDuration(activeVoice.duration_seconds, voiceSceneMarginSeconds)
+          : null,
       };
     });
     const sceneVoices = scenes.filter((scene) => scene.voicePath);
@@ -1083,9 +1313,18 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       if (sceneVoices.length && voice) {
         throw Object.assign(new Error('El proyecto tiene narración por escena y una grabación global. Desvincula una de las dos para evitar audio duplicado.'), { status: 409 });
       }
-      if (sceneVoices.some((scene) => scene.voiceDurationSeconds > scene.durationSeconds + 0.1)) {
-        const scene = sceneVoices.find((item) => item.voiceDurationSeconds > item.durationSeconds + 0.1);
-        throw Object.assign(new Error(`La narración de la escena ${scene.order + 1} dura ${scene.voiceDurationSeconds.toFixed(1)} s y no cabe en sus ${scene.durationSeconds} s. Ajusta la escena o regenera el audio; no se acelerará ni recortará automáticamente.`), { status: 409 });
+      if (sceneVoices.some((scene) => scene.voiceRequiredDurationSeconds > scene.durationSeconds)) {
+        const scene = sceneVoices.find((item) => item.voiceRequiredDurationSeconds > item.durationSeconds);
+        const requiredTotal = scenes.reduce((sum, item) => sum + Math.max(
+          item.durationSeconds,
+          item.voiceRequiredDurationSeconds || item.durationSeconds,
+        ), 0);
+        const limitMessage = requiredTotal > 180
+          ? ` La duración necesaria estimada sería ${requiredTotal} s, por encima del límite actual de 180 s; reduce la duración base de otras escenas.`
+          : '';
+        throw Object.assign(new Error(
+          `La narración de la escena ${scene.order + 1} dura ${scene.voiceDurationSeconds.toFixed(1)} s y necesita ${scene.voiceRequiredDurationSeconds} s con el margen de ${voiceSceneMarginSeconds} s; la escena dispone de ${scene.durationSeconds} s.${limitMessage} No se acelerará ni recortará automáticamente.`,
+        ), { status: 409 });
       }
     }
     return {
@@ -1099,6 +1338,7 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       scenes,
       voicePath: voice ? assetPath(voice) : null,
       musicPath: music ? assetPath(music) : null,
+      expectsAudio: Boolean(sceneVoices.length || voice || music),
       voiceName: voice?.original_name || null,
       musicName: music?.original_name || null,
     };
@@ -1129,12 +1369,12 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       videoInputs.push(`[v${index}]`);
     });
     filters.push(`${videoInputs.join('')}concat=n=${snapshot.scenes.length}:v=1:a=0[base]`);
-    if (snapshot.burnSubtitles && snapshot.scenes.some((scene) => scene.subtitleText.trim())) {
+    if (snapshot.burnSubtitles && snapshot.scenes.some((scene) => scene.subtitleText.trim() || scene.onScreenText?.trim())) {
       if (!ffmpegInfo.ffmpeg.subtitles) {
         throw Object.assign(new Error('Esta compilación de FFmpeg no incluye el filtro de subtítulos. Desactiva “Integrar subtítulos” o instala una compilación con libass.'), { code: 'subtitles_unsupported' });
       }
       const path = escapedFilterPath(subtitlePath);
-      filters.push(`[base]subtitles=filename='${path}':force_style='FontName=Arial,FontSize=22,Outline=2,Shadow=1,Alignment=2,MarginV=180'[vout]`);
+      filters.push(`[base]subtitles=filename='${path}'[vout]`);
     } else {
       filters.push('[base]null[vout]');
     }
@@ -1256,9 +1496,23 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     const startedAt = Date.now();
     let partialPath;
     let subtitlePath;
+    let subtitleAssPath;
     let subtitleExportPath;
     let finalPath;
     let snapshot;
+    async function cleanupRenderFile(path) {
+      if (!path) return;
+      try {
+        await rm(path, { force: true });
+      } catch (error) {
+        console.warn(JSON.stringify({
+          level: 'warn',
+          event: 'media_render_temp_cleanup_failed',
+          jobId: job.id,
+          code: error.code || 'cleanup_failed',
+        }));
+      }
+    }
     try {
       updateJob(job.id, 'preparing', 'Comprobando herramientas y preparando archivos', null, { started_at: timestamp() });
       const diagnosticInfo = await detectFfmpeg();
@@ -1270,17 +1524,26 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       partialPath = join(temporaryDirectory, `${job.id}.partial.mp4`);
       subtitlePath = join(temporaryDirectory, `${job.id}.srt`);
       finalPath = join(exportsDirectory, `${job.id}.mp4`);
-      const subtitleText = buildSrt(snapshot.scenes);
+      const subtitleText = buildSrt(snapshot.scenes, { width: snapshot.width, height: snapshot.height });
       await writeFile(subtitlePath, subtitleText, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-      const args = buildRenderArgs(snapshot, subtitlePath, partialPath, diagnosticInfo);
+      if (snapshot.burnSubtitles && snapshot.scenes.some((scene) => scene.subtitleText.trim() || scene.onScreenText?.trim())) {
+        subtitleAssPath = join(temporaryDirectory, `${job.id}.ass`);
+        const subtitleAss = buildSubtitleAss(snapshot.scenes, { width: snapshot.width, height: snapshot.height });
+        await writeFile(subtitleAssPath, subtitleAss, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      }
+      const args = buildRenderArgs(snapshot, subtitleAssPath || subtitlePath, partialPath, diagnosticInfo);
       if (cancelling.has(job.id)) throw Object.assign(new Error('El trabajo se canceló.'), { code: 'cancelled' });
-      const publicArgs = args.filter((item) => !String(item).includes(mediaRoot)).map((item) => item);
       console.info(JSON.stringify({
         level: 'info',
         event: 'media_render_started',
         jobId: job.id,
         projectId: job.project_id,
-        args: publicArgs.slice(0, 80),
+        sceneCount: snapshot.scenes.length,
+        audioInputCount: snapshot.scenes.filter((scene) => scene.voicePath).length +
+          Number(Boolean(snapshot.voicePath)) + Number(Boolean(snapshot.musicPath)),
+        width: snapshot.width,
+        height: snapshot.height,
+        durationSeconds: snapshot.durationSeconds,
       }));
       updateJob(job.id, 'processing', 'Renderizando con FFmpeg', null);
       let reportedTime = 0;
@@ -1319,9 +1582,10 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       const size = Number(metadata.format?.size);
       if (!video || !Number.isFinite(duration) || !Number.isFinite(size) || size <= 0 ||
         !String(metadata.format?.format_name).split(',').includes('mp4') ||
+        (snapshot.expectsAudio && (!audio || audio.codec_name !== 'aac')) ||
         video.width !== snapshot.width || video.height !== snapshot.height ||
         Math.abs(duration - snapshot.durationSeconds) > 0.75) {
-        throw Object.assign(new Error('FFprobe no confirmó un MP4 legible con la duración y resolución solicitadas.'), { code: 'export_validation_failed' });
+        throw Object.assign(new Error('FFprobe no confirmó un MP4 legible con video, audio esperado, duración y resolución solicitados.'), { code: 'export_validation_failed' });
       }
       const exportId = randomUUID();
       const outputRelative = `exports/${job.id}.mp4`;
@@ -1336,7 +1600,7 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
           exportId, job.project_id, job.id, outputRelative, subtitleRelative,
           duration, video.width, video.height, video.codec_name, audio?.codec_name || null, size, completedAt,
         );
-        database.prepare(`UPDATE media_render_jobs SET status = 'completed', stage = 'Exportación validada',
+        database.prepare(`UPDATE media_render_jobs SET status = 'completed', stage = 'Validación técnica completada; revisión visual pendiente',
           progress = 100, output_relpath = ?, completed_at = ?, duration_ms = ?, updated_at = ? WHERE id = ?`)
           .run(outputRelative, completedAt, Date.now() - startedAt, completedAt, job.id);
         database.prepare(`UPDATE media_projects SET status = 'completed', updated_at = ? WHERE id = ?`)
@@ -1348,9 +1612,21 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       running.delete(job.id);
       const cancelled = cancelling.has(job.id) || error.code === 'cancelled';
       const status = cancelled ? 'cancelled' : 'failed';
-      const safeMessage = error.code === 'ffmpeg_unavailable'
-        ? `${error.message} Instala FFmpeg/FFprobe o configura las rutas en .env.`
-        : safeError(error);
+      const safeMessage = cancelled
+        ? 'El trabajo se canceló.'
+        : error.code === 'ffmpeg_unavailable'
+          ? `${error.message} Instala FFmpeg/FFprobe o configura las rutas en .env.`
+          : safeError(error);
+      await cleanupRenderFile(finalPath);
+      finalPath = undefined;
+      await cleanupRenderFile(subtitleExportPath);
+      subtitleExportPath = undefined;
+      await cleanupRenderFile(partialPath);
+      partialPath = undefined;
+      await cleanupRenderFile(subtitlePath);
+      subtitlePath = undefined;
+      await cleanupRenderFile(subtitleAssPath);
+      subtitleAssPath = undefined;
       const completedAt = timestamp();
       updateJob(job.id, status, cancelled ? 'Cancelado' : 'Falló', null, {
         error_message: safeMessage,
@@ -1359,14 +1635,19 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       });
       database.prepare(`UPDATE media_projects SET status = ?, updated_at = ? WHERE id = ? AND status = 'rendering'`)
         .run(cancelled ? 'draft' : 'failed', completedAt, job.project_id);
-      console.error(JSON.stringify({ level: 'error', event: 'media_render_failed', jobId: job.id, code: error.code || 'render_error', message: safeMessage }));
-      if (finalPath) await rm(finalPath, { force: true }).catch(() => {});
-      if (subtitleExportPath) await rm(subtitleExportPath, { force: true }).catch(() => {});
+      console[cancelled ? 'info' : 'error'](JSON.stringify({
+        level: cancelled ? 'info' : 'error',
+        event: cancelled ? 'media_render_cancelled' : 'media_render_failed',
+        jobId: job.id,
+        code: error.code || (cancelled ? 'cancelled' : 'render_error'),
+        message: safeMessage,
+      }));
     } finally {
       running.delete(job.id);
       cancelling.delete(job.id);
-      if (partialPath) await rm(partialPath, { force: true }).catch(() => {});
-      if (subtitlePath) await rm(subtitlePath, { force: true }).catch(() => {});
+      await cleanupRenderFile(partialPath);
+      await cleanupRenderFile(subtitlePath);
+      await cleanupRenderFile(subtitleAssPath);
     }
   }
 
@@ -1487,9 +1768,8 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     return database.prepare('SELECT * FROM media_render_jobs ORDER BY created_at DESC LIMIT 100').all().map(publicJob);
   }
 
-  function getExports() {
-    return database.prepare(`SELECT e.*, p.title AS project_title FROM media_exports e
-      JOIN media_projects p ON p.id = e.project_id ORDER BY e.created_at DESC LIMIT 200`).all().map((row) => ({
+  function publicExport(row) {
+    return {
       id: row.id,
       projectId: row.project_id,
       projectTitle: row.project_title,
@@ -1499,10 +1779,19 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       videoCodec: row.video_codec,
       audioCodec: row.audio_codec,
       sizeBytes: row.size_bytes,
+      technicalValidationStatus: 'ffprobe_passed',
+      visualReviewStatus: row.visual_review_status,
+      visualReviewedAt: row.visual_reviewed_at,
+      visualReviewNote: row.visual_review_note,
       createdAt: row.created_at,
       fileUrl: `/media/exports/${row.id}/file?inline=true`,
       subtitleUrl: row.subtitle_path ? `/media/exports/${row.id}/subtitles` : null,
-    }));
+    };
+  }
+
+  function getExports() {
+    return database.prepare(`SELECT e.*, p.title AS project_title FROM media_exports e
+      JOIN media_projects p ON p.id = e.project_id ORDER BY e.created_at DESC LIMIT 200`).all().map(publicExport);
   }
 
   function registerUploadRoute(app) {
@@ -1596,6 +1885,7 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       if (!existsSync(path)) return res.status(410).json({ error: 'El archivo importado ya no existe en la biblioteca.' });
       res.type(asset.mime_type);
       res.set('X-Content-Type-Options', 'nosniff');
+      res.set('Cross-Origin-Resource-Policy', 'cross-origin');
       res.sendFile(path, (error) => { if (error && !res.headersSent) next(error); });
     });
     app.delete('/api/v1/media/assets/:id', (req, res) => {
@@ -1634,6 +1924,23 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
       return retryJob(req.params.id, res);
     });
     app.get('/api/v1/media/exports', (_req, res) => res.json(getExports()));
+    app.post('/api/v1/media/exports/:id/visual-review', (req, res) => {
+      if (!projectIdSchema.safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de exportación inválido.' });
+      const parsed = visualReviewSchema.safeParse(req.body);
+      if (!parsed.success) return res.status(400).json({ error: 'La revisión debe registrar approved o needs_changes y una nota de hasta 1,000 caracteres.' });
+      const item = database.prepare('SELECT * FROM media_exports WHERE id = ?').get(req.params.id);
+      if (!item) return res.status(404).json({ error: 'No se encontró la exportación.' });
+      const path = safeRelativePath(mediaRoot, item.relative_path);
+      if (!existsSync(path)) return res.status(410).json({ error: 'El archivo exportado no está disponible para revisión.' });
+      const reviewedAt = timestamp();
+      database.prepare(`UPDATE media_exports SET visual_review_status = ?, visual_reviewed_at = ?, visual_review_note = ?
+        WHERE id = ?`).run(parsed.data.status, reviewedAt, parsed.data.note || null, item.id);
+      const row = database.prepare(`SELECT e.*, p.title AS project_title FROM media_exports e
+        JOIN media_projects p ON p.id = e.project_id WHERE e.id = ?`).get(item.id);
+      const reviewed = row ? publicExport(row) : null;
+      if (!reviewed) throw new Error('La revisión visual se guardó, pero la exportación dejó de estar disponible.');
+      return res.json({ export: reviewed });
+    });
     app.get('/api/v1/media/exports/:id/file', (req, res, next) => {
       if (!projectIdSchema.safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de exportación inválido.' });
       const item = database.prepare('SELECT * FROM media_exports WHERE id = ?').get(req.params.id);
@@ -1697,5 +2004,15 @@ export function createMediaService({ database, dataDirectory, aiRouter, voiceEng
     await Promise.all([...activeVoiceTasks.values()].map((task) => task.then(() => {}, () => {})));
   }
 
-  return { diagnostic, getJobs, getExports, processQueue, recoverInterruptedJobs, registerUploadRoute, registerRoutes, shutdown };
+  return {
+    diagnostic,
+    getJobs,
+    getExports,
+    processQueue,
+    recoverInterruptedJobs,
+    registerUploadRoute,
+    registerRoutes,
+    saveGeneratedImage,
+    shutdown,
+  };
 }

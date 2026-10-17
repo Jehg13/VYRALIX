@@ -85,6 +85,7 @@ export function createAiService({ database, router }) {
         const checks = await router.checkProviders();
         res.json({ providers: router.providerSummaries(), checks });
       } catch (error) {
+        if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
         next(error);
       }
     });
@@ -147,7 +148,7 @@ export function createAiService({ database, router }) {
           generationId,
           errorCode: safe.code,
         }));
-        const statusCode = safe.code === 'no_provider' ? 503 : error instanceof ProviderError ? 502 : 500;
+        const statusCode = error.status || (safe.code === 'no_provider' ? 503 : error instanceof ProviderError ? 502 : 500);
         return res.status(statusCode).json({
           error: safe.message,
           code: safe.code,

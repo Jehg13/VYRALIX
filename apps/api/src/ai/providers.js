@@ -54,8 +54,11 @@ function classifyStatus(response, payload) {
       retryable: true, retryAfterSeconds: retryAfter(response), status,
     });
   }
-  if (status === 401 || status === 403 || /api.?key.?invalid|unauthorized|invalid.?credential/i.test(`${providerCode} ${providerMessage}`)) {
+  if (status === 401 || /api.?key.?invalid|unauthorized|invalid.?credential/i.test(`${providerCode} ${providerMessage}`)) {
     return new ProviderError('authentication', 'El proveedor rechazó las credenciales o los permisos.', { status });
+  }
+  if (status === 403 || /permission.?denied|insufficient.?permission/i.test(`${providerCode} ${providerMessage}`)) {
+    return new ProviderError('permission_error', 'La cuenta no tiene permisos para esta operación.', { status });
   }
   if (status === 404) return new ProviderError('model_not_found', 'El modelo configurado no está disponible.', { status });
   if (status >= 500) {
@@ -66,6 +69,23 @@ function classifyStatus(response, payload) {
     return new ProviderError(code, 'El proveedor rechazó la solicitud.', { status });
   }
   return null;
+}
+
+function transportError(error) {
+  const codes = [];
+  for (let current = error; current; current = current.cause) {
+    if (typeof current.code === 'string') codes.push(current.code);
+  }
+  if (codes.some((code) => ['ENOTFOUND', 'EAI_AGAIN'].includes(code))) {
+    return new ProviderError('dns', 'No se pudo resolver el host del proveedor.', { retryable: true });
+  }
+  if (codes.some((code) =>
+    code.startsWith('ERR_TLS_') || code.startsWith('ERR_SSL_') ||
+    ['CERT_HAS_EXPIRED', 'CERT_AUTHORITY_INVALID', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+      'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN'].includes(code))) {
+    return new ProviderError('tls', 'No se pudo establecer una conexión TLS segura con el proveedor.');
+  }
+  return new ProviderError('connectivity', 'No se pudo conectar con el proveedor.', { retryable: true });
 }
 
 async function postJson(url, { headers, body, timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = fetch, signal }) {
@@ -88,7 +108,7 @@ async function postJson(url, { headers, body, timeoutMs = DEFAULT_TIMEOUT_MS, fe
       if (controller.signal.aborted) {
         throw new ProviderError('timeout', 'La solicitud excedió el tiempo máximo permitido.', { retryable: true });
       }
-      throw new ProviderError('connectivity', 'No se pudo conectar con el proveedor.', { retryable: true });
+      throw transportError(error);
     }
     let payload;
     try {
@@ -97,9 +117,11 @@ async function postJson(url, { headers, body, timeoutMs = DEFAULT_TIMEOUT_MS, fe
       if (error instanceof ProviderError) throw error;
       if (signal?.aborted) throw new ProviderError('cancelled', 'La solicitud fue cancelada.');
       if (controller.signal.aborted) {
-        throw new ProviderError('timeout', 'La lectura excedió el tiempo máximo permitido.', { retryable: true });
+        throw new ProviderError('response_timeout', 'El proveedor respondió, pero el contenido excedió el tiempo máximo de lectura.', {
+          retryable: true, status: response.status,
+        });
       }
-      throw new ProviderError('connectivity', 'La respuesta del proveedor se interrumpió.', { retryable: true });
+      throw transportError(error);
     }
     if (!response.ok) throw classifyStatus(response, payload);
     return payload;

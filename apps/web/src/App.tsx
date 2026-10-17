@@ -9,7 +9,10 @@ import {
 import { api, formatDate, localDateTime, statusLabels, toIsoDateTime, type DashboardData, type Job, type Post, type PostInput, type PostStatus } from './api';
 import AiGenerator from './AiGenerator';
 import AiProviders from './AiProviders';
+import AutomationStudio from './AutomationStudio';
+import MediaLibrary from './MediaLibrary';
 import MediaStudio from './MediaStudio';
+import ResearchStudio from './ResearchStudio';
 
 type Notice = { kind: 'success' | 'error'; text: string } | null;
 const statuses = Object.keys(statusLabels) as PostStatus[];
@@ -116,7 +119,10 @@ function App() {
             <Route path="/contenido" element={<ContentPage onNotice={setNotice} />} />
             <Route path="/generador" element={<AiGenerator onNotice={setNotice} />} />
             <Route path="/media-studio" element={<MediaStudio onNotice={setNotice} />} />
-            <Route path="/configuracion" element={<AiProviders />} />
+            <Route path="/biblioteca" element={<MediaLibrary onNotice={setNotice} />} />
+            <Route path="/investigacion" element={<ResearchStudio onNotice={setNotice} />} />
+            <Route path="/automatizaciones" element={<AutomationStudio onNotice={setNotice} />} />
+            <Route path="/configuracion" element={<PlaceholderPage title="Configuración" />} />
             <Route path="/calendario" element={<CalendarPage onNotice={setNotice} />} />
             <Route path="/cola" element={<QueuePage onNotice={setNotice} />} />
             <Route path="*" element={<PlaceholderPage title={titles[location.pathname] || 'Módulo'} />} />
@@ -392,11 +398,10 @@ function QueuePage({ onNotice }: { onNotice: (notice: Notice) => void }) {
 function PlaceholderPage({ title }: { title: string }) {
   const moduleInfo: Record<string, { icon: ReactNode; text: string }> = {
     'Generador con IA': { icon: <Sparkles size={21} />, text: 'No hay un proveedor de IA configurado. Esta función se activará al agregar un proveedor real; no se simularán respuestas de modelos.' },
-    'Biblioteca multimedia': { icon: <FolderOpen size={21} />, text: 'La biblioteca multimedia local forma parte de una siguiente fase. Ningún archivo se ha subido ni generado todavía.' },
     'Tendencias e investigación': { icon: <Lightbulb size={21} />, text: 'Las tendencias y noticias requieren fuentes identificables. Aún no hay fuentes conectadas ni datos consultados.' },
     Analítica: { icon: <TrendingUp size={21} />, text: 'No hay métricas verificadas disponibles todavía. Las gráficas aparecerán cuando se incorporen datos reales.' },
     Integraciones: { icon: <Activity size={21} />, text: 'No hay integraciones conectadas. La publicación externa permanece deshabilitada hasta disponer de autorización oficial.' },
-    Automatizaciones: { icon: <Clapperboard size={21} />, text: 'El procesamiento local de pruebas ya funciona en Cola. Las automatizaciones editoriales se incorporarán en una siguiente fase.' },
+    Automatizaciones: { icon: <Clapperboard size={21} />, text: 'Administra tareas locales y externas persistentes, con control explícito de autorización, reintentos y disponibilidad.' },
     Configuración: { icon: <Settings2 size={21} />, text: 'Ajusta la prioridad del router de proveedores y comprueba el estado real de sus modelos. Las credenciales se configuran únicamente en el servidor local.' },
   };
   const info = moduleInfo[title] || { icon: <CircleHelp size={21} />, text: 'Este módulo aún no está habilitado.' };

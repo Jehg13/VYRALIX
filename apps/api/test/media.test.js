@@ -5,12 +5,56 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { allocateSubtitleSegments, buildSrt, createScenePlan, scenePlanSchema } from '../src/media/scene-planner.js';
+import { allocateSubtitleSegments, buildSrt, buildSubtitleAss, createScenePlan, scenePlanSchema } from '../src/media/scene-planner.js';
+import { layoutSubtitleText } from '../src/media/subtitle-layout.js';
 import { execFile } from 'node:child_process';
 import { detectFfmpeg, ffmpegPath, ffprobePath } from '../src/media/ffmpeg.js';
 
 const execFileAsync = promisify(execFile);
 const multimediaAvailability = await detectFfmpeg();
+
+test('FFmpeg diagnostics distinguish missing PATH tools, invalid configured paths, and launch failures', async () => {
+  const missingExecutable = async () => {
+    throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+  };
+  const pathMissing = await detectFfmpeg({ env: {}, readCapabilityImpl: missingExecutable });
+  assert.equal(pathMissing.ffmpeg.status, 'not_found');
+  assert.equal(pathMissing.ffprobe.status, 'not_found');
+  assert.match(pathMissing.ffmpeg.error, /PATH/u);
+
+  const invalidConfiguredPath = await detectFfmpeg({
+    env: { FFMPEG_PATH: 'C:\\tools\\missing-ffmpeg.exe', FFPROBE_PATH: 'C:\\tools\\missing-ffprobe.exe' },
+    readCapabilityImpl: missingExecutable,
+  });
+  assert.equal(invalidConfiguredPath.ffmpeg.status, 'configured_path_not_found');
+  assert.equal(invalidConfiguredPath.ffprobe.status, 'configured_path_not_found');
+  assert.match(invalidConfiguredPath.ffmpeg.error, /FFMPEG_PATH/u);
+  assert.match(invalidConfiguredPath.ffprobe.error, /FFPROBE_PATH/u);
+
+  const launchFailure = await detectFfmpeg({
+    env: {},
+    readCapabilityImpl: async () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); },
+  });
+  assert.equal(launchFailure.ffmpeg.status, 'execution_failed');
+  assert.equal(launchFailure.ffprobe.status, 'execution_failed');
+
+  const timedOut = await detectFfmpeg({
+    env: {},
+    readCapabilityImpl: async () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }); },
+  });
+  assert.equal(timedOut.ffmpeg.status, 'timed_out');
+  assert.equal(timedOut.ffprobe.status, 'timed_out');
+
+  const capabilityCheckFailed = await detectFfmpeg({
+    env: {},
+    readCapabilityImpl: async (_binary, args) => {
+      if (args[0] === '-version') return 'ffmpeg version test';
+      throw Object.assign(new Error('denied'), { code: 'EACCES' });
+    },
+  });
+  assert.equal(capabilityCheckFailed.ffmpeg.available, true);
+  assert.equal(capabilityCheckFailed.ffmpeg.status, 'capability_check_failed');
+});
 
 test('scene plans validate duration totals and subtitles use estimated scene timings', () => {
   const plan = createScenePlan({
@@ -31,7 +75,77 @@ test('scene plans validate duration totals and subtitles use estimated scene tim
   ];
   assert.deepEqual(allocateSubtitleSegments(scenes).map((segment) => [segment.startSeconds, segment.endSeconds]), [[0, 4], [6, 9]]);
   assert.match(buildSrt(scenes), /00:00:06,000 --> 00:00:09,000/);
-  assert.match(buildSrt(scenes), /Texto arriba\nPrimera línea/);
+  assert.doesNotMatch(buildSrt(scenes), /Texto arriba/u);
+  assert.match(buildSrt(scenes), /Primera línea/u);
+});
+
+test('subtitle layout wraps long text within safe geometry at supported vertical resolutions', () => {
+  const longText = 'Una narración extensa sobre una jugada histórica, con palabras de distinta anchura y signos de puntuación.';
+  for (const [width, height] of [[720, 1280], [1080, 1920]]) {
+    const title = layoutSubtitleText('Copa Mundial de la FIFA 2022', { width, height, role: 'title' });
+    const layout = layoutSubtitleText(longText, { width, height });
+    assert.equal(title.lines.length, 1);
+    assert.ok(title.bottom <= height * 0.26);
+    assert.ok(title.left + title.maxLineWidth <= width - title.right);
+    assert.ok(title.fontSizePixels >= title.minFontSizePixels);
+    assert.ok(title.fontSizePixels <= title.maxFontSizePixels);
+    assert.ok(layout.lines.length > 1);
+    assert.ok(layout.lines.length <= layout.maxLines);
+    assert.ok(layout.blockHeight <= layout.maxBlockHeight);
+    assert.ok(layout.lines.every((line) => line.length > 0));
+    assert.ok(layout.left >= width * 0.07);
+    assert.ok(layout.right >= width * 0.18);
+    assert.ok(layout.top >= height * 0.55);
+    assert.ok(layout.bottom <= height * 0.7);
+    assert.ok(title.bottom < layout.top);
+    assert.ok(layout.fontSizePixels >= layout.minFontSizePixels);
+    assert.ok(layout.fontSizePixels <= layout.maxFontSizePixels);
+    assert.ok(layout.lines.every((line) => Array.from(line).length > 0));
+    assert.ok(layout.lineWidths.every((lineWidth) => lineWidth <= layout.maxLineWidth));
+  }
+  assert.ok(layoutSubtitleText('M'.repeat(50), { width: 720, height: 1280 }).lines.length > 1);
+  const shortCaption = layoutSubtitleText('Una jugada histórica con balón y emoción', { width: 1080, height: 1920 });
+  assert.equal(shortCaption.fontSizePixels, shortCaption.maxFontSizePixels);
+  const shortCaption720 = layoutSubtitleText('Una jugada histórica con balón y emoción', { width: 720, height: 1280 });
+  assert.ok(Math.abs(shortCaption.fontSizePixels / 1080 - shortCaption720.fontSizePixels / 720) < 0.002);
+  const resizedCaption = layoutSubtitleText(`${longText} ${longText.slice(0, 28)}`, { width: 1080, height: 1920 });
+  assert.ok(resizedCaption.fontSizePixels < resizedCaption.maxFontSizePixels);
+
+  const scenes = [{
+    onScreenText: 'Título destacado',
+    subtitleText: 'Nacido en Rosario, Lionel Messi construyó una trayectoria destacada en el fútbol profesional, consolidándose con el FC Barcelona.',
+    durationSeconds: 4,
+  }];
+  const screenplay = buildSrt(scenes, { width: 720, height: 1280 });
+  assert.doesNotMatch(screenplay, /Título destacado/u);
+  assert.match(screenplay, /Nacido en Rosario/u);
+  assert.ok(screenplay.split('\n').filter(Boolean).length > 4);
+  const ass = buildSubtitleAss(scenes, { width: 720, height: 1280 });
+  assert.match(ass, /PlayResX: 720\nPlayResY: 1280/u);
+  assert.match(ass, /Dialogue: 1,0:00:00\.00,0:00:04\.00,Title/u);
+  assert.match(ass, /Dialogue: 0,0:00:00\.00,0:00:04\.00,Caption/u);
+  assert.match(ass, /\\pos\(360,128\)\\fs\d+\\q2/u);
+  assert.match(ass, /\\pos\(321,717\)\\fs\d+\\q2/u);
+  assert.match(ass, /FC Barcelona/u);
+});
+
+test('subtitle layout explicitly rejects blocks that exceed safe regions or invalid frame geometry', () => {
+  assert.throws(
+    () => layoutSubtitleText('Palabra '.repeat(160), { width: 1080, height: 1920 }),
+    { code: 'subtitle_layout_invalid' },
+  );
+  assert.throws(
+    () => layoutSubtitleText('Texto de prueba', { width: 1080, height: 1280 }),
+    { code: 'subtitle_layout_invalid' },
+  );
+  assert.throws(
+    () => layoutSubtitleText('M'.repeat(1000), { width: 720, height: 1280 }),
+    { code: 'subtitle_layout_invalid' },
+  );
+  assert.throws(
+    () => layoutSubtitleText('Este título es demasiado largo para la banda superior segura y no se debe dibujar encima de la narración o del contenido visual', { width: 720, height: 1280, role: 'title' }),
+    { code: 'subtitle_layout_invalid' },
+  );
 });
 
 test('FFmpeg genera un MP4 de integración y FFprobe confirma su stream', {
@@ -173,6 +287,7 @@ test('Media API imports local assets safely and persists projects, scenes and re
     const preview = await json(`/media/assets/${asset.id}/content`);
     assert.equal(preview.status, 200);
     assert.equal(preview.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(preview.headers.get('cross-origin-resource-policy'), 'cross-origin');
     assert.deepEqual(Buffer.from(await preview.arrayBuffer()), png);
     assert.equal((await json(`/media/assets/${asset.id}`, { method: 'DELETE' })).status, 400);
 

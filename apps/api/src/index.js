@@ -23,7 +23,7 @@ worker.unref();
 
 function shutdown() {
   clearInterval(worker);
-  void mediaService.shutdown().then(() => {
+  void Promise.all([app.locals.automationService.shutdown(), mediaService.shutdown()]).then(() => {
     server.close(() => {
       closeDatabase();
       process.exit(0);

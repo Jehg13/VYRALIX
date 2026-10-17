@@ -54,6 +54,7 @@ test('provider routing retries safely, fails over, validates JSON, and never exp
   const clock = (() => { let value = 1000; return () => value += 30; })();
 
   try {
+    db.prepare('UPDATE automation_settings SET external_operations_enabled = 1 WHERE id = 1').run();
     let geminiCalls = 0;
     let groqCalls = 0;
     const sleeps = [];
@@ -96,7 +97,7 @@ test('provider routing retries safely, fails over, validates JSON, and never exp
       providers: [
         provider('gemini', async () => {
           transientCalls += 1;
-          throw new ProviderError('timeout', 'timed out', { retryable: true });
+          throw new ProviderError('connectivity', 'connection reset', { retryable: true });
         }),
         provider('groq', async () => ({ text: responseText })),
         provider('ollama', async () => ({ text: responseText })),
@@ -108,6 +109,90 @@ test('provider routing retries safely, fails over, validates JSON, and never exp
     assert.equal(transient.provider, 'groq');
     assert.equal(transientCalls, 2);
     assert.deepEqual(retrySleeps, [250]);
+
+    clear();
+    let timeoutCalls = 0;
+    const timeoutRouter = createProviderRouter({
+      database: db,
+      providers: [provider('gemini', async () => {
+        timeoutCalls += 1;
+        throw new ProviderError('timeout', 'timed out', { retryable: true });
+      })],
+      sleep: async () => assert.fail('Timed-out requests must not be retried.'),
+      clock,
+    });
+    await assert.rejects(
+      runRouter(timeoutRouter, 'f73bdba8-6f77-4b15-9f83-0f8c7cad6df7'),
+      (error) => error.code === 'timeout' && error.failures.length === 1,
+    );
+    assert.equal(timeoutCalls, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM ai_provider_attempts WHERE error_code = 'timeout'").get().count, 1);
+
+    clear();
+    let structuredTimeoutCalls = 0;
+    const structuredTimeoutRouter = createProviderRouter({
+      database: db,
+      providers: [provider('gemini', async () => {
+        structuredTimeoutCalls += 1;
+        throw new ProviderError('timeout', 'timed out', { retryable: true });
+      })],
+      sleep: async () => assert.fail('Timed-out planning requests must not be retried.'),
+      clock,
+    });
+    await assert.rejects(
+      structuredTimeoutRouter.generateStructured({
+        prompt: 'small test prompt',
+        provider: 'gemini',
+        task: 'media_planning',
+      }),
+      (error) => error.code === 'timeout' && error.failures.length === 1,
+    );
+    assert.equal(structuredTimeoutCalls, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM ai_provider_attempts WHERE task = 'media_planning' AND error_code = 'timeout'").get().count, 1);
+
+    clear();
+    let invalidStructuredCalls = 0;
+    const invalidStructuredRouter = createProviderRouter({
+      database: db,
+      providers: [provider('gemini', async () => {
+        invalidStructuredCalls += 1;
+        return { text: 'not json' };
+      })],
+      sleep: async () => assert.fail('Invalid structured responses must not be retried.'),
+      clock,
+    });
+    await assert.rejects(
+      invalidStructuredRouter.generateStructured({
+        prompt: 'small test prompt',
+        provider: 'gemini',
+        task: 'media_planning',
+        validateResponse: () => { throw new ProviderError('response_invalid', 'invalid'); },
+      }),
+      (error) => error.code === 'response_invalid' && error.failures.length === 1,
+    );
+    assert.equal(invalidStructuredCalls, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM ai_provider_attempts WHERE task = 'media_planning' AND error_code = 'response_invalid'").get().count, 1);
+
+    clear();
+    let responseTimeoutCalls = 0;
+    const structuredResponseTimeoutRouter = createProviderRouter({
+      database: db,
+      providers: [provider('gemini', async () => {
+        responseTimeoutCalls += 1;
+        throw new ProviderError('response_timeout', 'response timed out', { retryable: true, status: 200 });
+      })],
+      sleep: async () => assert.fail('A response-read timeout must not repeat the provider request.'),
+      clock,
+    });
+    await assert.rejects(
+      structuredResponseTimeoutRouter.generateStructured({
+        prompt: 'small test prompt',
+        provider: 'gemini',
+        task: 'media_planning',
+      }),
+      (error) => error.code === 'response_timeout' && error.failures.length === 1,
+    );
+    assert.equal(responseTimeoutCalls, 1);
 
     clear();
     let authCalls = 0;
@@ -191,6 +276,11 @@ test('provider routing retries safely, fails over, validates JSON, and never exp
     })[1];
     await assert.rejects(groqAuth.generate('prompt'), (error) => error.code === 'authentication' && !error.retryable);
 
+    const groqForbidden = createProviderDefinitions(config, {
+      fetchImpl: async () => mockResponse({ error: { message: 'permission denied' } }, 403),
+    })[1];
+    await assert.rejects(groqForbidden.generate('prompt'), (error) => error.code === 'permission_error' && !error.retryable);
+
     const modelMissing = createProviderDefinitions(config, {
       fetchImpl: async () => mockResponse({ error: { message: 'not found' } }, 404),
     })[1];
@@ -202,9 +292,75 @@ test('provider routing retries safely, fails over, validates JSON, and never exp
       }),
     })[0];
     await assert.rejects(timeoutProvider.generate('prompt'), (error) => error.code === 'timeout' && error.retryable);
+    const responseTimeoutProvider = createProviderDefinitions({ ...config, timeoutMs: 20 }, {
+      fetchImpl: async (_url, options) => {
+        const body = new ReadableStream({
+          start(controller) {
+            options.signal.addEventListener('abort', () => controller.error(new Error('aborted')), { once: true });
+          },
+        });
+        return new Response(body, { status: 200 });
+      },
+    })[0];
+    await assert.rejects(responseTimeoutProvider.generate('prompt'), (error) =>
+      error.code === 'response_timeout' && error.status === 200 && error.retryable);
+    const dnsFailure = createProviderDefinitions(config, {
+      fetchImpl: async () => {
+        throw Object.assign(new Error('fetch failed'), {
+          cause: Object.assign(new Error('host unavailable'), { code: 'ENOTFOUND' }),
+        });
+      },
+    })[0];
+    await assert.rejects(dnsFailure.generate('prompt'), (error) => error.code === 'dns' && !error.message.includes('host unavailable'));
+    const tlsFailure = createProviderDefinitions(config, {
+      fetchImpl: async () => {
+        throw Object.assign(new Error('fetch failed'), {
+          cause: Object.assign(new Error('certificate invalid'), { code: 'CERT_HAS_EXPIRED' }),
+        });
+      },
+    })[0];
+    await assert.rejects(tlsFailure.generate('prompt'), (error) => error.code === 'tls' && !error.message.includes('certificate invalid'));
     const unsafeOllama = createProviderDefinitions({ ...config, ollamaBaseUrl: 'http://192.168.1.5:11434' })[2];
     assert.equal(unsafeOllama.configured, false);
     assert.deepEqual(unsafeOllama.missing, ['OLLAMA_BASE_URL']);
+
+    clear();
+    db.prepare('UPDATE automation_settings SET external_operations_enabled = 0 WHERE id = 1').run();
+    let blockedExternalCalls = 0;
+    let localCalls = 0;
+    const guardedRouter = createProviderRouter({
+      database: db,
+      providers: [
+        provider('gemini', async () => { blockedExternalCalls += 1; return { text: responseText }; }),
+        provider('groq', async () => { blockedExternalCalls += 1; return { text: responseText }; }),
+        provider('ollama', async () => { localCalls += 1; return { text: responseText }; }),
+      ],
+      sleep: async () => assert.fail('La operación bloqueada no debe reintentarse.'),
+    });
+    await assert.rejects(
+      runRouter(guardedRouter, 'f73bdba8-6f77-4b15-9f83-0f8c7cad6df8'),
+      (error) => error.code === 'external_operations_disabled' && error.status === 423,
+    );
+    assert.equal(blockedExternalCalls, 0);
+    await assert.rejects(
+      guardedRouter.checkProviders(),
+      (error) => error.code === 'external_operations_disabled' && error.status === 423,
+    );
+    assert.equal(blockedExternalCalls, 0);
+    await assert.rejects(
+      guardedRouter.generateStructured({ prompt: 'test planning prompt', provider: 'gemini' }),
+      (error) => error.code === 'external_operations_disabled' && error.status === 423,
+    );
+    assert.equal(blockedExternalCalls, 0);
+    db.prepare(`INSERT INTO ai_generations (id, request_hash, request_json, status, created_at)
+      VALUES (?, 'test-hash', '{}', 'pending', ?)`)
+      .run('f73bdba8-6f77-4b15-9f83-0f8c7cad6fd8', new Date().toISOString());
+    const localResult = await guardedRouter.generate({
+      input: { ...input, provider: 'ollama' },
+      generationId: 'f73bdba8-6f77-4b15-9f83-0f8c7cad6fd8',
+    });
+    assert.equal(localResult.provider, 'ollama');
+    assert.equal(localCalls, 1);
   } finally {
     closeDatabase();
     await rm(directory, { recursive: true, force: true });

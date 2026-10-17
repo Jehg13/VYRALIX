@@ -156,6 +156,25 @@ export default function MediaStudio({ onNotice }: { onNotice: (notice: Notice) =
     }
   }
 
+  async function reviewExport(item: MediaExport, status: 'approved' | 'needs_changes') {
+    setBusy(`review-${item.id}`);
+    setError('');
+    try {
+      const result = await api.reviewMediaExport(item.id, status);
+      setExports((current) => current.map((entry) => entry.id === item.id ? result.export : entry));
+      onNotice({
+        kind: 'success',
+        text: status === 'approved'
+          ? 'La revisión visual quedó registrada para esta exportación.'
+          : 'La exportación quedó marcada para correcciones visuales.',
+      });
+    } catch (reason) {
+      setError((reason as Error).message);
+    } finally {
+      setBusy('');
+    }
+  }
+
   async function createProject() {
     if (!postId) return;
     setBusy('create');
@@ -313,12 +332,17 @@ export default function MediaStudio({ onNotice }: { onNotice: (notice: Notice) =
   }
 
   async function assignAsset(scene: MediaScene, assetId: string) {
+    const selected = assets.find((asset) => asset.id === assetId);
+    const nextAssetId = assetId || null;
+    if (scene.asset?.id !== nextAssetId && scene.asset &&
+      !window.confirm(selected
+        ? `La escena ${scene.order + 1} ya tiene asignado “${scene.asset.originalName}”. ¿Quieres reemplazarlo por “${selected.originalName}”?`
+        : `La escena ${scene.order + 1} ya tiene asignado “${scene.asset.originalName}”. ¿Quieres quitarlo y usar el fondo de composición?`)) return;
     setBusy(`asset-${scene.id}`);
     setError('');
     try {
-      const selected = assets.find((asset) => asset.id === assetId);
       const result = await api.updateMediaScene(scene.id, {
-        assetId: assetId || null,
+        assetId: nextAssetId,
         visualType: selected && selected.kind !== 'audio' ? selected.kind : 'composition',
       });
       setProject(result.project);
@@ -492,10 +516,10 @@ export default function MediaStudio({ onNotice }: { onNotice: (notice: Notice) =
       <article className="panel media-metric"><span>PROYECTOS</span><strong>{diagnostics?.counts.projects ?? 0}</strong><small>Persistidos en SQLite</small></article>
       <article className="panel media-metric"><span>RECURSOS LOCALES</span><strong>{diagnostics?.counts.assets ?? 0}</strong><small>Archivos importados</small></article>
       <article className="panel media-metric"><span>TRABAJOS ACTIVOS</span><strong>{activeJobs.length}</strong><small>{failedJobs.length} fallidos en historial</small></article>
-      <article className="panel media-metric capability-metric"><span>FFMPEG / FFPROBE</span><strong className={diagnosticInfo?.ffmpeg.available && diagnosticInfo.ffprobe.available ? 'capability-on' : 'capability-off'}>{diagnosticInfo?.ffmpeg.available && diagnosticInfo.ffprobe.available ? 'Listo' : 'No disponible'}</strong><small>{diagnosticInfo?.ffmpeg.version || diagnosticInfo?.ffmpeg.error}</small></article>
+      <article className="panel media-metric capability-metric"><span>FFMPEG / FFPROBE</span><strong className={diagnosticInfo?.ffmpeg.available && diagnosticInfo.ffmpeg.status === 'available' && diagnosticInfo.ffprobe.available ? 'capability-on' : 'capability-off'}>{diagnosticInfo?.ffmpeg.available && diagnosticInfo.ffmpeg.status === 'available' && diagnosticInfo.ffprobe.available ? 'Listo' : 'Revisar diagnóstico'}</strong><small>{diagnosticInfo?.ffmpeg.error || diagnosticInfo?.ffprobe.error || diagnosticInfo?.ffmpeg.version}</small></article>
     </div>
 
-    {diagnosticInfo && (!diagnosticInfo.ffmpeg.available || !diagnosticInfo.ffprobe.available) && <section className="media-diagnostic-banner">
+    {diagnosticInfo && (!diagnosticInfo.ffmpeg.available || diagnosticInfo.ffmpeg.status !== 'available' || !diagnosticInfo.ffprobe.available) && <section className="media-diagnostic-banner">
       <AlertCircle size={18} /><div><strong>La app sigue funcionando; los renderizados requieren FFmpeg y FFprobe.</strong>
         <p>{diagnosticInfo.ffmpeg.error || diagnosticInfo.ffprobe.error} En Windows puedes instalar una distribución mantenida y confiable de FFmpeg o definir <code>FFMPEG_PATH</code> y <code>FFPROBE_PATH</code> en el archivo .env. No se descarga ni instala desde VYRALIX.</p>
         <p>El plan usa 720 × 1280, 30 FPS y codificación por CPU. Las escenas sin imagen o clip usan un fondo abstracto local; no se generan imágenes ni videos realistas.</p>
@@ -589,7 +613,7 @@ export default function MediaStudio({ onNotice }: { onNotice: (notice: Notice) =
             <label className="wide">Narración<textarea rows={3} maxLength={3000} value={scene.voiceText} disabled={busy !== ''} onChange={(event) => editPlannedScene(index, 'voiceText', event.target.value)} /></label>
             <label className="wide">Diálogo<textarea rows={2} maxLength={3000} value={scene.dialogue} disabled={busy !== ''} onChange={(event) => editPlannedScene(index, 'dialogue', event.target.value)} /></label>
             <label>Subtítulo estimado<textarea rows={2} maxLength={1000} value={scene.subtitleText} disabled={busy !== ''} onChange={(event) => editPlannedScene(index, 'subtitleText', event.target.value)} /></label>
-            <label>Texto en pantalla<input maxLength={300} value={scene.onScreenText} disabled={busy !== ''} onChange={(event) => editPlannedScene(index, 'onScreenText', event.target.value)} /></label>
+            <label>Título / texto en pantalla (zona superior)<input maxLength={300} value={scene.onScreenText} disabled={busy !== ''} onChange={(event) => editPlannedScene(index, 'onScreenText', event.target.value)} /></label>
             <label>Transición<select value={scene.transition} disabled={busy !== ''} onChange={(event) => editPlannedScene(index, 'transition', event.target.value as PlannedScene['transition'])}><option value="cut">Corte directo</option><option value="fade">Fundido</option></select></label>
             <label>Audio y ambiente<input maxLength={300} value={scene.audioNotes} disabled={busy !== ''} onChange={(event) => editPlannedScene(index, 'audioNotes', event.target.value)} /></label>
           </div>
@@ -640,9 +664,13 @@ export default function MediaStudio({ onNotice }: { onNotice: (notice: Notice) =
                 <small>{scene.voiceAudio.durationSeconds?.toFixed(1)} s reales · WAV {scene.voiceAudio.sampleRate ? `${Math.round(scene.voiceAudio.sampleRate / 1000)} kHz` : ''} · {scene.voiceAudio.voiceId}</small>
                 {scene.voiceAudio.stale
                   ? <small className="media-voice-warning">El texto cambió desde esta versión. Regenera antes de renderizar para sincronizar voz y escena.</small>
-                  : scene.voiceAudio.durationSeconds !== null && scene.voiceAudio.durationSeconds > scene.durationSeconds + 0.1
-                    ? <small className="media-voice-warning">La voz excede los {scene.durationSeconds} s de la escena. No se recortará ni acelerará.</small>
-                    : null}
+                  : scene.voiceDurationUnavailable
+                    ? <small className="media-voice-warning">No se pudo confirmar la duración real de este WAV; regenera la voz antes de renderizar.</small>
+                    : scene.voiceTiming.needsMoreTime
+                      ? <small className="media-voice-warning">Este WAV necesita {scene.voiceTiming.requiredDurationSeconds} s con el margen de {diagnostics?.limits.voiceSceneMarginSeconds ?? 0.5} s, pero tiene {scene.durationSeconds} s. {project.voiceTimingSummary.exceedsProjectLimit ? `La duración total necesaria sería ${project.voiceTimingSummary.requiredDurationSeconds} s; el límite del proyecto es 180 s. Reduce la duración de otras escenas.` : 'Se ajustará antes del render.'} No se recortará ni acelerará.</small>
+                      : scene.voiceTiming.autoAdjusted
+                        ? <small>Duración ajustada automáticamente: {scene.durationSeconds} s (estimación previa {scene.plannedDurationSeconds} s + margen de seguridad).</small>
+                        : <small>Duración {scene.durationSource === 'manual' ? 'manual' : 'estimada'}: {scene.durationSeconds} s; el audio completo cabe con el margen configurado.</small>}
               </>}
               {scene.voiceGeneration?.status === 'failed' && <small className="media-voice-warning">{scene.voiceGeneration.error}</small>}
               {scene.voiceGeneration?.status === 'processing' && <progress className="media-progress" />}
@@ -654,7 +682,7 @@ export default function MediaStudio({ onNotice }: { onNotice: (notice: Notice) =
             </div>}
             <label>Diálogo<textarea rows={2} value={draft.dialogue} onChange={(event) => editScene(scene, 'dialogue', event.target.value)} /></label>
             <label>Subtítulo estimado<textarea rows={2} value={draft.subtitleText} onChange={(event) => editScene(scene, 'subtitleText', event.target.value)} /></label>
-            <label>Texto en pantalla<textarea rows={1} value={draft.onScreenText} onChange={(event) => editScene(scene, 'onScreenText', event.target.value)} /></label>
+            <label>Título / texto en pantalla (zona superior)<textarea rows={1} value={draft.onScreenText} onChange={(event) => editScene(scene, 'onScreenText', event.target.value)} /></label>
             <details className="media-scene-direction"><summary>Dirección visual y continuidad</summary>
               <label>Tipo de plano<input maxLength={120} value={draft.shotType} onChange={(event) => editScene(scene, 'shotType', event.target.value)} /></label>
               <label>Movimiento de cámara<input maxLength={240} value={draft.cameraMovement} onChange={(event) => editScene(scene, 'cameraMovement', event.target.value)} /></label>
@@ -677,7 +705,8 @@ export default function MediaStudio({ onNotice }: { onNotice: (notice: Notice) =
           <div className="media-preview-wrap"><div className="media-preview" style={{ aspectRatio: `${project.width} / ${project.height}` }}>
             {project.scenes[0]?.asset?.kind === 'image' && <img src={api.mediaAssetUrl(project.scenes[0].asset.id)} alt="" />}
             {project.scenes[0]?.asset?.kind === 'video' && <video src={api.mediaAssetUrl(project.scenes[0].asset.id)} muted controls />}
-            <span className="media-preview-caption">{[project.scenes[0]?.onScreenText, project.scenes[0]?.subtitleText].filter(Boolean).join(' · ') || 'Subtítulo de la primera escena'}</span>
+            {project.scenes[0]?.onScreenText && <span className="media-preview-title">{project.scenes[0].onScreenText}</span>}
+            {project.scenes[0]?.subtitleText && <span className="media-preview-caption">{project.scenes[0].subtitleText}</span>}
           </div><small>Previsualización de composición · no es el video renderizado</small></div>
           <div className="media-export-options">
             <h3>Exportación MP4 vertical</h3>
@@ -685,10 +714,16 @@ export default function MediaStudio({ onNotice }: { onNotice: (notice: Notice) =
             <label>Duración objetivo<select value={project.durationSeconds} onChange={(event) => void updateSettings({ durationSeconds: Number(event.target.value) })}>{[15, 30, 45, 60].map((seconds) => <option key={seconds} value={seconds}>{seconds} segundos</option>)}{![15, 30, 45, 60].includes(project.durationSeconds) && <option value={project.durationSeconds}>{project.durationSeconds} segundos (actual)</option>}</select></label>
             <label>FPS<select value={project.fps} onChange={(event) => void updateSettings({ fps: Number(event.target.value) as MediaProject['fps'] })}>{[24, 25, 30, 60].map((fps) => <option key={fps}>{fps}</option>)}</select></label>
             <label>Calidad (CRF)<select value={project.crf} onChange={(event) => void updateSettings({ crf: Number(event.target.value) })}>{[20, 23, 25, 28, 32].map((crf) => <option key={crf}>{crf}</option>)}{![20, 23, 25, 28, 32].includes(project.crf) && <option value={project.crf}>{project.crf} · actual</option>}</select></label>
-            <label className="media-checkbox"><input type="checkbox" checked={project.burnSubtitles} onChange={(event) => void updateSettings({ burnSubtitles: event.target.checked })} /> Integrar subtítulos estimados (SRT)</label>
+            <label className="media-checkbox"><input type="checkbox" checked={project.burnSubtitles} onChange={(event) => void updateSettings({ burnSubtitles: event.target.checked })} /> Integrar títulos y subtítulos con zonas seguras</label>
             <label>Narración grabada<select value={project.voiceAssetId || ''} onChange={(event) => void updateSettings({ voiceAssetId: event.target.value || null })}><option value="">Sin archivo de voz asignado</option>{assets.filter((asset) => asset.kind === 'audio').map((asset) => <option key={asset.id} value={asset.id}>{asset.originalName}</option>)}</select></label>
             <label>Música de fondo<select value={project.musicAssetId || ''} onChange={(event) => void updateSettings({ musicAssetId: event.target.value || null })}><option value="">Sin música asignada</option>{assets.filter((asset) => asset.kind === 'audio').map((asset) => <option key={asset.id} value={asset.id}>{asset.originalName}</option>)}</select></label>
-            {project.scenes.some((scene) => scene.subtitleText.trim()) && <p className="media-estimate-note">Los tiempos de subtítulos se estiman por escena, no están alineados palabra por palabra. También se exporta un archivo SRT.</p>}
+            <p className={project.voiceTimingSummary.exceedsProjectLimit ? 'media-voice-warning' : 'media-estimate-note'}>
+              Duración del proyecto: {project.durationSeconds} s · {project.voiceTimingSummary.confirmedVoiceScenes} narración(es) con WAV validado.
+              {project.voiceTimingSummary.exceedsProjectLimit
+                ? ` Las narraciones requieren ${project.voiceTimingSummary.requiredDurationSeconds} s; el máximo es ${project.voiceTimingSummary.projectLimitSeconds} s.`
+                : ` Margen tras cada narración: ${project.voiceTimingSummary.marginSeconds} s.`}
+            </p>
+            {project.scenes.some((scene) => scene.subtitleText.trim()) && <p className="media-estimate-note">Los subtítulos se ajustan a un máximo de 3 líneas en una zona independiente; sus tiempos se estiman por escena, no por palabra. El SRT exportado contiene solo la narración.</p>}
             {pendingAiVisuals > 0 && <small className="media-plan-cost-note">{pendingAiVisuals} escena(s) necesitan imágenes o clips propios antes de renderizar este plan IA.</small>}
             <button className="button primary media-render-button" disabled={busy !== '' || !diagnosticInfo?.ffmpeg.available || !diagnosticInfo.ffprobe.available || activeJobs.some((job) => job.projectId === project.id) || pendingAiVisuals > 0} onClick={() => void startRender()}><Play size={15} />{busy === 'render' ? 'Encolando…' : 'Renderizar video real'}</button>
             {!diagnosticInfo?.ffmpeg.available && <small>Instala y detecta FFmpeg antes de renderizar.</small>}
@@ -709,8 +744,8 @@ export default function MediaStudio({ onNotice }: { onNotice: (notice: Notice) =
           {job.status === 'failed' && <button className="button secondary small-button" disabled={busy !== ''} onClick={() => void retryJob(job)}>{busy === `retry-${job.id}` ? 'Reintentando…' : 'Reintentar'}</button>}
         </article>)}</div> : <div className="media-empty compact"><Video size={18} /><strong>Sin trabajos</strong><span>Los renderizados reales aparecerán aquí.</span></div>}
       </section>
-      <section className="panel media-exports-panel"><div className="panel-heading"><div><div className="eyebrow">ARCHIVOS VALIDADOS</div><h2>Exportaciones</h2><p>Solo archivos confirmados por FFprobe se listan como completados.</p></div><Download size={16} className="muted-icon" /></div>
-        {exports.length ? exports.map((item) => <article className="media-export-row" key={item.id}><div><strong>{item.projectTitle}</strong><small>{item.width}×{item.height} · {item.durationSeconds.toFixed(1)}s · {item.videoCodec}{item.audioCodec ? ` + ${item.audioCodec}` : ''} · {fileSize(item.sizeBytes)}</small><small>{formatDate(item.createdAt)}</small></div><div className="media-export-actions"><video controls preload="none" src={api.mediaFileUrl(item.fileUrl)} /><a className="button secondary small-button" href={api.mediaFileUrl(item.fileUrl.replace('?inline=true', ''))} download><Download size={13} /> MP4</a>{item.subtitleUrl && <a className="text-link" href={api.mediaFileUrl(item.subtitleUrl)} download> SRT</a>}</div></article>) : <div className="media-empty compact"><Download size={18} /><strong>Sin exportaciones</strong><span>Los resultados validados quedarán en data/media/exports.</span></div>}
+      <section className="panel media-exports-panel"><div className="panel-heading"><div><div className="eyebrow">VALIDACIÓN TÉCNICA</div><h2>Exportaciones</h2><p>FFprobe confirma la estructura del archivo; la revisión visual independiente sigue siendo necesaria antes de publicar.</p></div><Download size={16} className="muted-icon" /></div>
+        {exports.length ? exports.map((item) => <article className="media-export-row" key={item.id}><div><strong>{item.projectTitle}</strong><small>{item.width}×{item.height} · {item.durationSeconds.toFixed(1)}s · {item.videoCodec}{item.audioCodec ? ` + ${item.audioCodec}` : ''} · {fileSize(item.sizeBytes)}</small><small>{formatDate(item.createdAt)}</small><small>Técnica: {item.technicalValidationStatus === 'ffprobe_passed' ? 'FFprobe confirmada' : 'pendiente'} · Visual: {item.visualReviewStatus === 'pending' ? 'revisión manual pendiente' : item.visualReviewStatus === 'approved' ? 'aprobada manualmente' : 'requiere correcciones'}</small>{item.visualReviewedAt && <small>Revisión registrada: {formatDate(item.visualReviewedAt)}</small>}{item.visualReviewNote && <small>Nota: {item.visualReviewNote}</small>}</div><div className="media-export-actions"><video controls preload="none" src={api.mediaFileUrl(item.fileUrl)} /><a className="button secondary small-button" href={api.mediaFileUrl(item.fileUrl.replace('?inline=true', ''))} download><Download size={13} /> MP4</a>{item.subtitleUrl && <a className="text-link" href={api.mediaFileUrl(item.subtitleUrl)} download> SRT</a>}<button className="button secondary small-button" disabled={busy !== ''} onClick={() => void reviewExport(item, 'approved')}>{busy === `review-${item.id}` ? 'Guardando…' : 'Registrar aprobación visual'}</button><button className="button secondary small-button" disabled={busy !== ''} onClick={() => void reviewExport(item, 'needs_changes')}>Marcar requiere cambios</button></div></article>) : <div className="media-empty compact"><Download size={18} /><strong>Sin exportaciones</strong><span>Los resultados confirmados técnicamente aparecerán aquí; requieren revisión visual aparte.</span></div>}
       </section>
     </div>
     <footer className="media-footer-note">Genera narración local por escena con las voces instaladas de Windows o importa una grabación propia. No se realizan descargas de redes ni publicaciones externas. Límites actuales: {diagnostics ? `${Math.round(diagnostics.limits.maxUploadBytes / (1024 * 1024))} MiB por archivo · ${diagnostics.limits.maxConcurrent} trabajo(s) simultáneo(s)` : 'carga protegida'}.</footer>

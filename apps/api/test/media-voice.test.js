@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -39,7 +39,7 @@ test('Media Studio genera, valida, conserva y renderiza voces locales por escena
   const { db, dbPath, closeDatabase } = await import('../src/db.js');
   const { detectFfmpeg, ffprobePath } = await import('../src/media/ffmpeg.js');
   const { createApp } = await import('../src/app.js');
-  const engineState = { mode: 'normal', start: null };
+  const engineState = { mode: 'normal', start: null, durationSeconds: 1.25 };
   const voiceEngine = {
     id: 'windows_sapi',
     async listVoices() {
@@ -56,7 +56,7 @@ test('Media Studio genera, valida, conserva y renderiza voces locales por escena
           signal.addEventListener('abort', () => reject(Object.assign(new Error('cancelled'), { code: 'cancelled' })), { once: true });
         });
       }
-      await writeFile(outputPath, testWave());
+      await writeFile(outputPath, testWave(engineState.durationSeconds));
     },
   };
   const app = createApp({ voiceEngine });
@@ -204,11 +204,28 @@ test('Media Studio genera, valida, conserva y renderiza voces locales por escena
     assert.equal(edit.body.project.scenes[0].voiceAudio.stale, true);
     const staleRender = await json(origin, `/media/projects/${project.id}/render`, { method: 'POST', body: '{}' });
     assert.equal(staleRender.response.status, 409);
+    engineState.durationSeconds = 6.2;
     const regenerated = await startVoice(origin, project.id, scene.id);
     const currentVoice = await waitForGeneration(regenerated.body.generation.id);
     assert.equal(currentVoice.status, 'completed');
     assert.notEqual(currentVoice.id, firstVoice.id);
     assert.equal(currentVoice.active, true);
+    const syncedProject = await json(origin, `/media/projects/${project.id}`);
+    assert.equal(syncedProject.body.scenes[0].plannedDurationSeconds, 5);
+    assert.equal(syncedProject.body.scenes[0].durationSeconds, 7);
+    assert.equal(syncedProject.body.durationSeconds, 7);
+    assert.equal(syncedProject.body.scenes[0].voiceTiming.autoAdjusted, true);
+    assert.equal(syncedProject.body.scenes[0].voiceTiming.needsMoreTime, false);
+    assert.equal(syncedProject.body.voiceTimingSummary.marginSeconds, 0.5);
+    db.prepare('UPDATE media_scene_voice_generations SET duration_seconds = NULL WHERE id = ?').run(currentVoice.id);
+    const unknownDuration = await json(origin, `/media/projects/${project.id}`);
+    assert.equal(unknownDuration.body.scenes[0].voiceDurationUnavailable, true);
+    assert.equal(unknownDuration.body.voiceTimingSummary.confirmedVoiceScenes, 0);
+    const unmeasuredRender = await json(origin, `/media/projects/${project.id}/render`, { method: 'POST', body: '{}' });
+    assert.equal(unmeasuredRender.response.status, 409);
+    assert.match(unmeasuredRender.body.error, /FFprobe no confirmó la duración/);
+    db.prepare('UPDATE media_scene_voice_generations SET duration_seconds = ? WHERE id = ?')
+      .run(currentVoice.durationSeconds, currentVoice.id);
 
     const invalidFileId = await fetch(`${origin}/media/voice-generations/not-a-uuid/file`);
     assert.equal(invalidFileId.status, 400);
@@ -228,6 +245,7 @@ test('Media Studio genera, valida, conserva y renderiza voces locales por escena
       const exported = db.prepare('SELECT * FROM media_exports WHERE job_id = ?').get(jobId);
       assert.ok(exported);
       assert.equal(exported.audio_codec, 'aac');
+      assert.equal(exported.duration_seconds, 7);
       const mediaPath = join(directory, 'media', exported.relative_path);
       const probe = await execFileAsync(ffprobePath(), [
         '-v', 'error', '-show_entries', 'stream=codec_type,codec_name,width,height', '-of', 'json', mediaPath,
@@ -235,6 +253,8 @@ test('Media Studio genera, valida, conserva y renderiza voces locales por escena
       const streams = JSON.parse(probe.stdout).streams;
       assert.ok(streams.some((stream) => stream.codec_type === 'audio' && stream.codec_name === 'aac'));
       assert.ok(streams.some((stream) => stream.codec_type === 'video' && stream.codec_name === 'h264'));
+      const subtitle = await readFile(join(directory, 'media', exported.subtitle_path), 'utf8');
+      assert.match(subtitle, /00:00:07,000/);
     } else {
       t.diagnostic('FFmpeg not found; real MP4 compatibility subtest skipped.');
     }
@@ -242,6 +262,8 @@ test('Media Studio genera, valida, conserva y renderiza voces locales por escena
     const unlink = await json(origin, `/media/voice-generations/${currentVoice.id}/unlink`, { method: 'POST', body: '{}' });
     assert.equal(unlink.response.status, 200);
     assert.equal(unlink.body.project.scenes[0].voiceAudio, null);
+    assert.equal(unlink.body.project.scenes[0].durationSeconds, 5);
+    assert.equal(unlink.body.project.durationSeconds, 5);
     const retainedFile = await fetch(`${origin}/media/voice-generations/${currentVoice.id}/file`);
     assert.equal(retainedFile.status, 200);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM media_scene_voice_generations WHERE project_id = ?').get(project.id).count, 6);

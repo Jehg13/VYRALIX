@@ -9,6 +9,10 @@ import { db, dbPath } from './db.js';
 import { createProviderRouter } from './ai/provider-router.js';
 import { createAiService } from './ai/service.js';
 import { createMediaService } from './media/service.js';
+import { createImageGenerationService } from './media/image-generation.js';
+import { createResearchService } from './research/service.js';
+import { createAutomationService } from './automation/service.js';
+import { assertExternalOperationsEnabled } from './automation/external-operations.js';
 
 const postStatuses = [
   'idea', 'draft', 'pending_review', 'approved', 'scheduled',
@@ -43,6 +47,14 @@ const jobInput = z.object({ postId: z.string().uuid() });
 
 function now() {
   return new Date().toISOString();
+}
+
+function logAutomationFailure(error) {
+  console.error(JSON.stringify({
+    level: 'error',
+    event: 'automation_task_request_failed',
+    code: typeof error?.code === 'string' ? error.code : 'automation_error',
+  }));
 }
 
 function toPost(row) {
@@ -97,6 +109,10 @@ function createRateLimiter(maxRequests, windowMs, message) {
 export function createApp({
   aiRouter = createProviderRouter({ database: db }),
   voiceEngine,
+  imageGenerationFetch = fetch,
+  imageGenerationAuthorization = () => assertExternalOperationsEnabled(db),
+  researchFetch = fetch,
+  researchConfig,
 } = {}) {
   const app = express();
   app.disable('x-powered-by');
@@ -113,6 +129,69 @@ export function createApp({
     },
   }));
   const mediaService = createMediaService({ database: db, dataDirectory: dirname(dbPath), aiRouter, voiceEngine });
+  const imageGenerationService = createImageGenerationService({
+    mediaService,
+    fetchImpl: imageGenerationFetch,
+    assertExternalOperationsEnabled: imageGenerationAuthorization,
+  });
+  const researchService = createResearchService({ database: db, aiRouter, fetchImpl: researchFetch, config: researchConfig });
+  const aiProviders = aiRouter.providerSummaries?.() || [];
+  const imageCapabilities = imageGenerationService.settings();
+  const automationHandlers = {
+    research: {
+      external: () => true,
+      provider: () => 'gemini',
+      model: () => researchService.capabilities().model,
+      run: async (params, { signal, attemptKey }) => {
+        const record = await researchService.search(params.input, attemptKey, signal);
+        return { result: { researchId: record.id, status: record.status }, relatedResourceId: record.id };
+      },
+    },
+    proposal: {
+      external: (params) => params.provider !== 'ollama',
+      provider: (params) => params.provider,
+      model: (params) => aiProviders.find((provider) => provider.id === params.provider)?.model || null,
+      run: async (params, { signal, attemptKey }) => {
+        const record = await researchService.generateProposal(
+          params.researchId, params.provider, params.confirmExternalCost === true, attemptKey, signal,
+        );
+        return {
+          result: { researchId: record.id, proposalStatus: record.proposalStatus },
+          relatedResourceId: record.id,
+          provider: record.proposalProvider,
+          model: record.proposalModel,
+        };
+      },
+    },
+    image_generation: {
+      external: () => true,
+      provider: () => 'gemini_image',
+      model: () => imageCapabilities.model,
+      run: async (params, { signal, attemptKey }) => {
+        const preview = await imageGenerationService.generate(params, attemptKey, signal);
+        return {
+          result: { previewId: preview.id, contentUrl: preview.contentUrl },
+          relatedResourceId: preview.id,
+          provider: 'gemini',
+          model: preview.model,
+        };
+      },
+    },
+    media_preflight: {
+      external: () => false,
+      provider: () => 'local',
+      run: async () => ({ result: await mediaService.diagnostic() }),
+    },
+  };
+  const automationService = createAutomationService({
+    database: db,
+    handlers: automationHandlers,
+    providerConfiguration: [
+      ...aiProviders.map((provider) => ({ provider: provider.id, model: provider.model, configured: provider.configured })),
+      { provider: 'gemini_image', model: imageCapabilities.model, configured: imageCapabilities.enabled },
+      { provider: 'local', model: null, configured: true },
+    ],
+  });
   mediaService.registerUploadRoute(app);
   app.use(express.json({ limit: '256kb' }));
 
@@ -123,6 +202,193 @@ export function createApp({
     createRateLimiter(4, 60_000, 'Límite de planificación audiovisual alcanzado. Espera un minuto antes de volver a solicitar.'),
     createRateLimiter(20, 60_000, 'Límite de generación de voz local alcanzado. Espera un minuto antes de volver a solicitar.'),
   );
+  imageGenerationService.registerRoutes(
+    app,
+    createRateLimiter(3, 60_000, 'Límite local de generación de imágenes alcanzado. Espera un minuto antes de volver a solicitar.'),
+  );
+  const automationTaskId = z.string().uuid();
+  app.get('/api/v1/automation/providers', (_req, res) => res.json({ providers: automationService.providers() }));
+  app.get('/api/v1/automation/settings', (_req, res) => res.json(automationService.settings()));
+  app.put('/api/v1/automation/settings', (req, res) => {
+    const parsed = z.object({ externalOperationsEnabled: z.boolean() }).strict().safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'El estado de operaciones externas no es válido.' });
+    try {
+      return res.json(automationService.setExternalOperationsEnabled(parsed.data.externalOperationsEnabled));
+    } catch (error) {
+      logAutomationFailure(error);
+      return res.status(500).json({ error: 'No se pudo actualizar la protección de operaciones externas.' });
+    }
+  });
+  app.get('/api/v1/automation/tasks', (req, res) => {
+    const parsed = z.object({ limit: z.coerce.number().int().min(1).max(100).default(50) }).safeParse(req.query);
+    if (!parsed.success) return res.status(400).json({ error: 'El límite de tareas debe estar entre 1 y 100.' });
+    res.json({ tasks: automationService.list(parsed.data.limit) });
+  });
+  app.post('/api/v1/automation/tasks', createRateLimiter(30, 60_000, 'Límite local de tareas alcanzado. Espera un minuto antes de volver a encolar.'), (req, res) => {
+    try {
+      const task = automationService.enqueue(req.body, req.get('Idempotency-Key'));
+      return res.status(202).json({ task });
+    } catch (error) {
+      if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
+      logAutomationFailure(error);
+      return res.status(500).json({ error: 'No se pudo encolar la tarea.' });
+    }
+  });
+  app.get('/api/v1/automation/tasks/:id', (req, res) => {
+    if (!automationTaskId.safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de tarea inválido.' });
+    const task = automationService.get(req.params.id);
+    if (!task) return res.status(404).json({ error: 'No se encontró la tarea.' });
+    res.json({ task });
+  });
+  app.post('/api/v1/automation/tasks/:id/authorize', (req, res) => {
+    if (!automationTaskId.safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de tarea inválido.' });
+    try {
+      const task = automationService.authorize(req.params.id, req.body?.confirmExternalOperation === true);
+      if (!task) return res.status(404).json({ error: 'No se encontró la tarea.' });
+      return res.json({ task });
+    } catch (error) {
+      if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
+      logAutomationFailure(error);
+      return res.status(500).json({ error: 'No se pudo autorizar la tarea.' });
+    }
+  });
+  app.post('/api/v1/automation/tasks/:id/cancel', (req, res) => {
+    if (!automationTaskId.safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de tarea inválido.' });
+    try {
+      const task = automationService.cancel(req.params.id);
+      if (!task) return res.status(404).json({ error: 'No se encontró la tarea.' });
+      return res.json({ task });
+    } catch (error) {
+      if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
+      logAutomationFailure(error);
+      return res.status(500).json({ error: 'No se pudo cancelar la tarea.' });
+    }
+  });
+  app.post('/api/v1/automation/tasks/:id/retry', (req, res) => {
+    if (!automationTaskId.safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de tarea inválido.' });
+    try {
+      const task = automationService.retry(req.params.id, req.body?.confirmExternalOperation === true);
+      if (!task) return res.status(404).json({ error: 'No se encontró la tarea.' });
+      return res.status(202).json({ task });
+    } catch (error) {
+      if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
+      logAutomationFailure(error);
+      return res.status(500).json({ error: 'No se pudo reintentar la tarea.' });
+    }
+  });
+  app.get('/api/v1/research/capabilities', (_req, res) => res.json(researchService.capabilities()));
+  app.get('/api/v1/research', (req, res) => {
+    const parsed = z.object({ limit: z.coerce.number().int().min(1).max(50).default(20) }).safeParse(req.query);
+    if (!parsed.success) return res.status(400).json({ error: 'El límite de investigaciones debe estar entre 1 y 50.' });
+    res.json(researchService.list(parsed.data.limit));
+  });
+  app.post('/api/v1/research', createRateLimiter(5, 60_000, 'Límite local de búsquedas alcanzado. Espera un minuto antes de volver a investigar.'), (req, res, next) => {
+    const controller = new AbortController();
+    const abort = () => {
+      if (!res.writableEnded) controller.abort(new Error('client_cancelled'));
+    };
+    req.once('aborted', abort);
+    res.once('close', abort);
+    void researchService.search(req.body, req.get('Idempotency-Key'), controller.signal)
+      .then((result) => {
+        if (result && !res.headersSent) res.status(201).json(result);
+      })
+      .catch((error) => {
+        if (res.destroyed) return;
+        if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
+        next(error);
+      })
+      .finally(() => {
+        req.off('aborted', abort);
+        res.off('close', abort);
+      });
+  });
+  app.get('/api/v1/research/:id', (req, res) => {
+    if (!z.string().uuid().safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de investigación inválido.' });
+    const record = researchService.get(req.params.id);
+    if (!record) return res.status(404).json({ error: 'No se encontró la investigación.' });
+    res.json(record);
+  });
+  app.post('/api/v1/research/:id/proposal', createRateLimiter(10, 60_000, 'Límite local de propuestas alcanzado. Espera un minuto antes de volver a intentarlo.'), (req, res, next) => {
+    if (!z.string().uuid().safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de investigación inválido.' });
+    const parsed = z.object({
+      provider: z.enum(['gemini', 'groq', 'ollama']),
+      confirmExternalCost: z.boolean().default(false),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Selecciona un proveedor compatible.' });
+    const controller = new AbortController();
+    const abort = () => {
+      if (!res.writableEnded) controller.abort(new Error('client_cancelled'));
+    };
+    req.once('aborted', abort);
+    res.once('close', abort);
+    void researchService.generateProposal(
+      req.params.id, parsed.data.provider, parsed.data.confirmExternalCost,
+      req.get('Idempotency-Key'), controller.signal,
+    ).then((record) => {
+      if (!res.headersSent) res.json(record);
+    }).catch((error) => {
+      if (res.destroyed) return;
+      if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
+      next(error);
+    }).finally(() => {
+      req.off('aborted', abort);
+      res.off('close', abort);
+    });
+  });
+  app.put('/api/v1/research/:id/proposal', (req, res, next) => {
+    if (!z.string().uuid().safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de investigación inválido.' });
+    try {
+      res.json(researchService.updateProposal(req.params.id, req.body.proposal));
+    } catch (error) {
+      if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
+      next(error);
+    }
+  });
+  app.post('/api/v1/research/:id/proposal/sections', createRateLimiter(10, 60_000, 'Límite local de regeneraciones alcanzado. Espera un minuto antes de volver a intentarlo.'), (req, res, next) => {
+    if (!z.string().uuid().safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de investigación inválido.' });
+    const controller = new AbortController();
+    const abort = () => {
+      if (!res.writableEnded) controller.abort(new Error('client_cancelled'));
+    };
+    req.once('aborted', abort);
+    res.once('close', abort);
+    void researchService.regenerateSection(
+      req.params.id, req.body, req.get('Idempotency-Key'), controller.signal,
+    ).then((record) => {
+      if (!res.headersSent) res.json(record);
+    }).catch((error) => {
+      if (res.destroyed) return;
+      if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
+      next(error);
+    }).finally(() => {
+      req.off('aborted', abort);
+      res.off('close', abort);
+    });
+  });
+  app.post('/api/v1/research/:id/approve', (req, res, next) => {
+    if (!z.string().uuid().safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de investigación inválido.' });
+    try {
+      res.json(researchService.approveProposal(req.params.id));
+    } catch (error) {
+      if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
+      next(error);
+    }
+  });
+  app.post('/api/v1/research/:id/send-to-media', (req, res, next) => {
+    if (!z.string().uuid().safeParse(req.params.id).success) return res.status(400).json({ error: 'Identificador de investigación inválido.' });
+    try {
+      const result = researchService.sendToMedia(req.params.id);
+      res.json({
+        research: result.record,
+        post: toPost(result.post),
+        existing: result.existing,
+      });
+    } catch (error) {
+      if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
+      next(error);
+    }
+  });
   aiService.registerRoutes(
     app,
     createRateLimiter(8, 60_000, 'Límite local de generación alcanzado. Espera un minuto antes de volver a solicitar.'),
@@ -320,6 +586,7 @@ export function createApp({
     res.status(500).json({ error: 'Ocurrió un error interno. Revisa el registro del servidor.' });
   });
   app.locals.mediaService = mediaService;
+  app.locals.automationService = automationService;
   return app;
 }
 

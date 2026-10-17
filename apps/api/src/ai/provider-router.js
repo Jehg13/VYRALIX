@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { db as defaultDb } from '../db.js';
+import { assertExternalOperationsEnabled } from '../automation/external-operations.js';
 import { ProviderError, safeProviderError } from './provider-error.js';
 import { createProviderDefinitions } from './providers.js';
 import { buildPrompt, parseGeneratedText } from './schema.js';
@@ -81,7 +82,7 @@ export function createProviderRouter({
   }
 
   function providerSummaries() {
-    const ordering = priority();
+    const ordering = priority().filter((id) => byId.has(id));
     return ordering.map((id, index) => {
       const provider = byId.get(id);
       const state = database.prepare('SELECT * FROM ai_provider_state WHERE provider = ?').get(id);
@@ -122,6 +123,7 @@ export function createProviderRouter({
       }
       const started = clock();
       try {
+        if (provider.id === 'gemini' || provider.id === 'groq') assertExternalOperationsEnabled(database);
         const check = await provider.check();
         const availability = check.modelValid ? 'available' : 'model_invalid';
         const checkedAt = timestamp();
@@ -136,6 +138,7 @@ export function createProviderRouter({
         });
         results.push({ id: provider.id, availability, errorCode: null });
       } catch (error) {
+        if (error?.code === 'external_operations_disabled') throw error;
         const safe = safeProviderError(error);
         const checkedAt = timestamp();
         database.prepare(`INSERT INTO ai_provider_state (provider, availability, models_json, checked_at, error_code)
@@ -173,6 +176,7 @@ export function createProviderRouter({
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         totalAttempt += 1;
         const started = clock();
+        if (provider.id === 'gemini' || provider.id === 'groq') assertExternalOperationsEnabled(database);
         try {
           const response = await provider.generate(prompt);
           let result;
@@ -204,7 +208,8 @@ export function createProviderRouter({
         } catch (error) {
           const safe = safeProviderError(error);
           const retryAfterSeconds = error instanceof ProviderError ? error.retryAfterSeconds : null;
-          const retrying = safe.retryable && safe.code !== 'rate_limited' && attempt < maxAttempts;
+          const retrying = safe.retryable &&
+            !['rate_limited', 'timeout', 'response_timeout'].includes(safe.code) && attempt < maxAttempts;
           recordAttempt({
             generationId,
             provider: provider.id,
@@ -232,6 +237,7 @@ export function createProviderRouter({
       finalFailure?.retryAfterSeconds != null
         ? `Los proveedores no pudieron atender la solicitud. El proveedor limitado indicó Retry-After de ${finalFailure.retryAfterSeconds} segundos.`
         : 'Ningún proveedor compatible pudo completar la generación. Revisa su configuración y vuelve a intentarlo.',
+      { retryAfterSeconds: finalFailure?.retryAfterSeconds ?? null },
     );
     error.failures = failures;
     throw error;
@@ -257,69 +263,59 @@ export function createProviderRouter({
     const failures = [];
     let totalAttempt = 0;
     for (const provider of candidates) {
-      for (let attempt = 1; attempt <= RETRIES + 1; attempt += 1) {
-        if (signal?.aborted) throw new ProviderError('cancelled', 'La solicitud fue cancelada.');
-        totalAttempt += 1;
-        const started = clock();
-        let currentPrompt = prompt;
-        if (attempt > 1 && failures.at(-1)?.code === 'response_invalid') {
-          currentPrompt = `${prompt}\n\nLa respuesta anterior no cumplió el esquema. Reintenta una sola vez; devuelve únicamente un objeto JSON completo que cumpla exactamente la estructura solicitada.`;
+      if (signal?.aborted) throw new ProviderError('cancelled', 'La solicitud fue cancelada.');
+      totalAttempt += 1;
+      const started = clock();
+      if (provider.id === 'gemini' || provider.id === 'groq') assertExternalOperationsEnabled(database);
+      try {
+        const response = await provider.generate(prompt, { signal });
+        const value = validateResponse(response.text);
+        const usage = response.usage || null;
+        recordAttempt({
+          provider: provider.id,
+          model: provider.model,
+          task,
+          outcome: 'success',
+          durationMs: Math.max(0, clock() - started),
+          attempt: totalAttempt,
+          fallbackReason: failures.length ? failures.at(-1).code : null,
+          usage,
+        });
+        return {
+          value,
+          provider: provider.id,
+          model: provider.model,
+          attempts: totalAttempt,
+          usage,
+          fallbackReason: failures.length ? failures.at(-1).code : null,
+        };
+      } catch (error) {
+        if (signal?.aborted || error?.code === 'cancelled') {
+          throw new ProviderError('cancelled', 'La solicitud fue cancelada.');
         }
-        try {
-          const response = await provider.generate(currentPrompt, { signal });
-          const value = validateResponse(response.text);
-          const usage = response.usage || null;
-          recordAttempt({
-            provider: provider.id,
-            model: provider.model,
-            task,
-            outcome: 'success',
-            durationMs: Math.max(0, clock() - started),
-            attempt: totalAttempt,
-            fallbackReason: failures.length ? failures.at(-1).code : null,
-            usage,
-          });
-          return {
-            value,
-            provider: provider.id,
-            model: provider.model,
-            attempts: totalAttempt,
-            usage,
-            fallbackReason: failures.length ? failures.at(-1).code : null,
-          };
-        } catch (error) {
-          if (signal?.aborted || error?.code === 'cancelled') {
-            throw new ProviderError('cancelled', 'La solicitud fue cancelada.');
-          }
-          const safe = safeProviderError(error);
-          const retryAfterSeconds = error instanceof ProviderError ? error.retryAfterSeconds : null;
-          const retrying = (safe.retryable || safe.code === 'response_invalid') && attempt < RETRIES + 1;
-          recordAttempt({
-            provider: provider.id,
-            model: provider.model,
-            task,
-            outcome: 'failed',
-            errorCode: safe.code,
-            durationMs: Math.max(0, clock() - started),
-            attempt: totalAttempt,
-            fallbackReason: retrying ? 'retrying_structured_response' : (failures.at(-1)?.code || null),
-            retryAfterSeconds,
-          });
-          failures.push({ provider: provider.id, code: safe.code, retryAfterSeconds });
-          if (retrying) {
-            if (safe.code !== 'response_invalid') await sleep(Math.min(250 * (2 ** (attempt - 1)), 2000));
-            continue;
-          }
-          break;
-        }
+        const safe = safeProviderError(error);
+        const retryAfterSeconds = error instanceof ProviderError ? error.retryAfterSeconds : null;
+        recordAttempt({
+          provider: provider.id,
+          model: provider.model,
+          task,
+          outcome: 'failed',
+          errorCode: safe.code,
+          durationMs: Math.max(0, clock() - started),
+          attempt: totalAttempt,
+          fallbackReason: failures.at(-1)?.code || null,
+          retryAfterSeconds,
+        });
+        failures.push({ provider: provider.id, code: safe.code, retryAfterSeconds });
       }
     }
     const finalFailure = failures.at(-1);
     const error = new ProviderError(
       finalFailure?.code || 'no_provider',
       finalFailure?.code === 'response_invalid'
-        ? 'El proveedor devolvió una respuesta incompleta o inválida incluso después de un reintento. El proyecto no se modificó.'
+        ? 'El proveedor devolvió una respuesta incompleta o inválida. El proyecto no se modificó.'
         : 'Ningún proveedor compatible pudo completar la planificación. Revisa su configuración y vuelve a intentarlo.',
+      { retryAfterSeconds: finalFailure?.retryAfterSeconds ?? null },
     );
     error.failures = failures;
     throw error;

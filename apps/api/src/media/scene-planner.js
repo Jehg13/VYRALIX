@@ -1,4 +1,10 @@
 import { z } from 'zod';
+import {
+  assTimestamp,
+  escapeAssText,
+  layoutSubtitleText,
+  subtitleAssStyleBlock,
+} from './subtitle-layout.js';
 
 export const sceneSchema = z.object({
   order: z.number().int().min(0).max(31),
@@ -156,6 +162,8 @@ export function projectFromRow(row, database) {
       title: scene.detail_title || '',
       narrativeGoal: scene.narrative_goal || '',
       durationSeconds: scene.duration_seconds,
+      plannedDurationSeconds: scene.planned_duration_seconds,
+      durationSource: scene.duration_source,
       voiceText: scene.voice_text,
       dialogue: scene.dialogue || '',
       subtitleText: scene.subtitle_text,
@@ -220,11 +228,29 @@ function srtTime(seconds) {
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')},${String(millis).padStart(3, '0')}`;
 }
 
-export function buildSrt(scenes) {
+export function buildSrt(scenes, { width = 1080, height = 1920 } = {}) {
   return allocateSubtitleSegments(scenes)
-    .map((segment) => {
-      const text = [segment.onScreenText, segment.text].filter(Boolean).join('\n');
-      return `${segment.index}\n${srtTime(segment.startSeconds)} --> ${srtTime(segment.endSeconds)}\n${text.replace(/-->/g, '→')}\n`;
+    .filter((segment) => segment.text)
+    .map((segment, index) => {
+      const captionLines = layoutSubtitleText(segment.text, { width, height, role: 'caption' }).lines;
+      return `${index + 1}\n${srtTime(segment.startSeconds)} --> ${srtTime(segment.endSeconds)}\n${captionLines.join('\n')}\n`;
     })
     .join('\n');
+}
+
+export function buildSubtitleAss(scenes, { width, height }) {
+  const events = allocateSubtitleSegments(scenes).flatMap((segment) => {
+    const entries = [
+      { text: segment.onScreenText, role: 'title', style: 'Title', layer: 1 },
+      { text: segment.text, role: 'caption', style: 'Caption', layer: 0 },
+    ];
+    return entries.flatMap(({ text, role, style, layer }) => {
+      if (!text) return [];
+      const layout = layoutSubtitleText(text, { width, height, role });
+      const position = `{\\an8\\pos(${layout.anchorX},${layout.anchorY})\\fs${layout.fontSizePixels}\\q2}`;
+      const lines = escapeAssText(layout.lines.join('\n')).replace(/\n/gu, '\\N');
+      return [`Dialogue: ${layer},${assTimestamp(segment.startSeconds)},${assTimestamp(segment.endSeconds)},${style},,0,0,0,,${position}${lines}`];
+    });
+  });
+  return `${subtitleAssStyleBlock({ width, height })}\n${events.join('\n')}\n`;
 }

@@ -34,6 +34,65 @@ export type Job = {
   updatedAt: string;
 };
 export type AiProviderId = 'gemini' | 'groq' | 'ollama';
+export type ResearchInput = {
+  niche: string;
+  audience: string;
+  market: string;
+  language: string;
+  goal: string;
+  format: string;
+  durationSeconds: number;
+  confirmExternalSearch: true;
+};
+export type ResearchSource = {
+  id: string;
+  title: string;
+  url: string;
+  sourceName: string;
+  publishedAt: string | null;
+  consultedAt: string;
+  excerpt: string | null;
+  currentness: 'consulted_now';
+};
+export type ResearchEvidence = {
+  statement: string;
+  sourceIds: string[];
+  evidenceLevel: 'reported' | 'inference' | 'needs_verification';
+};
+export type ResearchProposal = {
+  title: string;
+  centralIdea: string;
+  targetAudience: string;
+  hook: string;
+  narrativeDevelopment: string;
+  durationSeconds: number;
+  description: string;
+  hashtags: string[];
+  claims: ResearchEvidence[];
+  scenes: { order: number; durationSeconds: number; voiceover: string; visualProposal: string; sourceIds: string[] }[];
+};
+export type ResearchRecord = {
+  id: string;
+  request: Omit<ResearchInput, 'confirmExternalSearch'>;
+  status: 'pending' | 'completed' | 'failed' | 'cancelled';
+  result: {
+    summary: string;
+    findings: ResearchEvidence[];
+    angles: { title: string; hook: string; rationale: string }[];
+    sources: ResearchSource[];
+    popularity: { status: 'not_measured'; note: string };
+  } | null;
+  errorCode: string | null;
+  provider: 'gemini';
+  model: string | null;
+  proposal: ResearchProposal | null;
+  proposalStatus: 'none' | 'draft' | 'approved' | 'sent_to_media';
+  proposalProvider: AiProviderId | null;
+  proposalModel: string | null;
+  mediaPostId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
 export type AiProvider = {
   id: AiProviderId;
   name: string;
@@ -122,12 +181,60 @@ export type MediaAsset = {
   missing: boolean;
   createdAt: string;
 };
+export type ImageGenerationCapabilities = {
+  provider: 'gemini';
+  enabled: boolean;
+  model: string | null;
+  availableModels: { id: string; name: string }[];
+  missing: string[];
+  mayIncurCost: boolean;
+};
+export type ImageGenerationPreview = {
+  id: string;
+  provider: string;
+  model: string;
+  contentUrl: string;
+};
+export type AutomationTaskType = 'research' | 'proposal' | 'image_generation' | 'media_preflight';
+export type AutomationTaskStatus = 'queued' | 'running' | 'waiting_for_authorization' | 'waiting_for_external_enabled' | 'waiting_for_quota' | 'succeeded' | 'failed' | 'cancelled';
+export type AutomationTask = {
+  id: string;
+  idempotencyKey: string;
+  type: AutomationTaskType;
+  status: AutomationTaskStatus;
+  stage: string;
+  result: Record<string, unknown> | null;
+  errorCode: string | null;
+  error: string | null;
+  provider: string | null;
+  model: string | null;
+  external: boolean;
+  attempts: number;
+  maxAttempts: number;
+  lastAttemptAt: string | null;
+  nextAttemptAt: string | null;
+  cancelRequested: boolean;
+  relatedResourceId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+export type AutomationProviderState = {
+  provider: string;
+  model: string | null;
+  configured: boolean;
+  status: 'unknown' | 'available' | 'not_configured' | 'rate_limited' | 'quota_limited' | 'authentication_error' | 'permission_error' | 'model_unavailable' | 'timeout' | 'unavailable';
+  errorCode: string | null;
+  retryAt: string | null;
+  updatedAt: string;
+};
 export type MediaScene = {
   id: string;
   order: number;
   title: string;
   narrativeGoal: string;
   durationSeconds: number;
+  plannedDurationSeconds: number;
+  durationSource: 'estimated' | 'manual';
   voiceText: string;
   dialogue: string;
   subtitleText: string;
@@ -150,6 +257,17 @@ export type MediaScene = {
   asset: Pick<MediaAsset, 'id' | 'originalName' | 'kind' | 'mimeType' | 'sizeBytes'> | null;
   voiceAudio: MediaVoiceGeneration | null;
   voiceGeneration: MediaVoiceGeneration | null;
+  voiceTiming: {
+    plannedDurationSeconds: number;
+    currentDurationSeconds: number;
+    voiceDurationSeconds: number | null;
+    requiredDurationSeconds: number | null;
+    targetDurationSeconds: number;
+    durationSource: 'estimated' | 'manual';
+    autoAdjusted: boolean;
+    needsMoreTime: boolean;
+  };
+  voiceDurationUnavailable: boolean;
 };
 export type MediaVoiceGeneration = {
   id: string;
@@ -226,6 +344,13 @@ export type MediaProject = {
     createdAt: string;
   } | null;
   scenes: MediaScene[];
+  voiceTimingSummary: {
+    marginSeconds: number;
+    requiredDurationSeconds: number;
+    projectLimitSeconds: number;
+    exceedsProjectLimit: boolean;
+    confirmedVoiceScenes: number;
+  };
   createdAt: string;
   updatedAt: string;
 };
@@ -253,18 +378,35 @@ export type MediaExport = {
   videoCodec: string;
   audioCodec: string | null;
   sizeBytes: number;
+  technicalValidationStatus: 'ffprobe_passed';
+  visualReviewStatus: 'pending' | 'approved' | 'needs_changes';
+  visualReviewedAt: string | null;
+  visualReviewNote: string | null;
   createdAt: string;
   fileUrl: string;
   subtitleUrl: string | null;
 };
 export type MediaDiagnostics = {
   ffmpeg: {
-    ffmpeg: { available: boolean; version: string | null; h264: boolean; aac: boolean; subtitles: boolean; error: string | null };
-    ffprobe: { available: boolean; version: string | null; error: string | null };
+    ffmpeg: {
+      available: boolean;
+      status: 'unknown' | 'available' | 'not_found' | 'configured_path_not_found' | 'execution_failed' | 'timed_out' | 'capability_check_failed';
+      version: string | null;
+      h264: boolean;
+      aac: boolean;
+      subtitles: boolean;
+      error: string | null;
+    };
+    ffprobe: {
+      available: boolean;
+      status: 'unknown' | 'available' | 'not_found' | 'configured_path_not_found' | 'execution_failed' | 'timed_out';
+      version: string | null;
+      error: string | null;
+    };
     windowsSetup: string;
   };
   voiceProviders: MediaVoiceProvider[];
-  limits: { maxUploadBytes: number; maxConcurrent: number; maxDurationSeconds: number; defaultWidth: number; defaultHeight: number };
+  limits: { maxUploadBytes: number; maxConcurrent: number; maxDurationSeconds: number; defaultWidth: number; defaultHeight: number; voiceSceneMarginSeconds: number };
   counts: { assets: number; projects: number; activeJobs: number };
   storage: { mediaDirectory: string; exportsDirectory: string };
 };
@@ -310,6 +452,31 @@ export const api = {
   createJob: (postId: string) => request<Job>('/jobs', { method: 'POST', body: JSON.stringify({ postId }) }),
   createBackup: () => request<{ path: string; createdAt: string }>('/backup', { method: 'POST', body: '{}' }),
   aiProviders: () => request<{ providers: AiProvider[]; priority: AiProviderId[] }>('/ai/providers'),
+  researchCapabilities: () => request<{ configured: boolean; provider: 'gemini'; model: string | null; reason: string | null; searchMethod: string; popularityDataAvailable: false }>('/research/capabilities'),
+  researches: () => request<ResearchRecord[]>('/research'),
+  research: (id: string) => request<ResearchRecord>(`/research/${id}`),
+  searchResearch: (input: ResearchInput, requestId: string, signal?: AbortSignal) => request<ResearchRecord>('/research', {
+    method: 'POST', headers: { 'Idempotency-Key': requestId }, body: JSON.stringify(input), signal,
+  }),
+  generateResearchProposal: (id: string, values: { provider: AiProviderId; confirmExternalCost: boolean }, requestId: string, signal?: AbortSignal) =>
+    request<ResearchRecord>(`/research/${id}/proposal`, {
+      method: 'POST', headers: { 'Idempotency-Key': requestId }, body: JSON.stringify(values), signal,
+    }),
+  regenerateResearchSection: (
+    id: string,
+    values: { provider: AiProviderId; confirmExternalCost: boolean; section: 'hook' | 'narrativeDevelopment' | 'hashtags' | 'sceneVoiceover'; sceneOrder?: number },
+    requestId: string,
+    signal?: AbortSignal,
+  ) => request<ResearchRecord>(`/research/${id}/proposal/sections`, {
+    method: 'POST', headers: { 'Idempotency-Key': requestId }, body: JSON.stringify(values), signal,
+  }),
+  saveResearchProposal: (id: string, proposal: ResearchProposal) => request<ResearchRecord>(`/research/${id}/proposal`, {
+    method: 'PUT', body: JSON.stringify({ proposal }),
+  }),
+  approveResearchProposal: (id: string) => request<ResearchRecord>(`/research/${id}/approve`, { method: 'POST', body: '{}' }),
+  sendResearchToMedia: (id: string) => request<{ research: ResearchRecord; post: Post; existing: boolean }>(`/research/${id}/send-to-media`, {
+    method: 'POST', body: '{}',
+  }),
   checkAiProviders: () => request<{ providers: AiProvider[]; checks: { id: AiProviderId; availability: AiProvider['availability']; errorCode: string | null }[] }>('/ai/providers/check', { method: 'POST', body: '{}' }),
   setAiPriority: (priority: AiProviderId[]) => request<{ priority: AiProviderId[] }>('/ai/providers/priority', { method: 'PUT', body: JSON.stringify({ priority }) }),
   aiGenerations: (limit = 20) => request<AiGeneration[]>(`/ai/generations?limit=${limit}`),
@@ -326,6 +493,26 @@ export const api = {
     method: 'POST', body: JSON.stringify({ variantIndex }),
   }),
   mediaDiagnostics: () => request<MediaDiagnostics>('/media/diagnostics'),
+  automationTasks: () => request<{ tasks: AutomationTask[] }>('/automation/tasks?limit=100'),
+  automationProviders: () => request<{ providers: AutomationProviderState[] }>('/automation/providers'),
+  automationSettings: () => request<{ externalOperationsEnabled: boolean; updatedAt: string }>('/automation/settings'),
+  setAutomationExternalOperations: (enabled: boolean) => request<{ externalOperationsEnabled: boolean; updatedAt: string }>('/automation/settings', {
+    method: 'PUT', body: JSON.stringify({ externalOperationsEnabled: enabled }),
+  }),
+  enqueueAutomationTask: (input: Record<string, unknown>, idempotencyKey: string) =>
+    request<{ task: AutomationTask }>('/automation/tasks', {
+      method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(input),
+    }),
+  authorizeAutomationTask: (id: string) =>
+    request<{ task: AutomationTask }>(`/automation/tasks/${id}/authorize`, {
+      method: 'POST', body: JSON.stringify({ confirmExternalOperation: true }),
+    }),
+  cancelAutomationTask: (id: string) =>
+    request<{ task: AutomationTask }>(`/automation/tasks/${id}/cancel`, { method: 'POST', body: '{}' }),
+  retryAutomationTask: (id: string, confirmExternalOperation: boolean) =>
+    request<{ task: AutomationTask }>(`/automation/tasks/${id}/retry`, {
+      method: 'POST', body: JSON.stringify({ confirmExternalOperation }),
+    }),
   mediaProjects: () => request<MediaProject[]>('/media/projects'),
   mediaProject: (id: string) => request<MediaProject>(`/media/projects/${id}`),
   createMediaProject: (postId: string, durationSeconds = 30) => request<{ project: MediaProject; existing: boolean }>('/media/projects', {
@@ -359,6 +546,20 @@ export const api = {
     method: 'POST', body: '{}',
   }),
   mediaAssets: (kind?: MediaAsset['kind']) => request<MediaAsset[]>(`/media/assets${kind ? `?kind=${kind}` : ''}`),
+  mediaImageGenerationCapabilities: () => request<ImageGenerationCapabilities>('/media/image-generations/capabilities'),
+  generateMediaImage: (
+    values: { provider: 'gemini'; model: string; prompt: string; confirmCost: true },
+    requestId: string,
+    signal?: AbortSignal,
+  ) => request<ImageGenerationPreview>('/media/image-generations', {
+    method: 'POST',
+    headers: { 'Idempotency-Key': requestId },
+    body: JSON.stringify(values),
+    signal,
+  }),
+  saveGeneratedMediaImage: (id: string) =>
+    request<{ asset: MediaAsset; duplicate: boolean }>(`/media/image-generations/${id}/save`, { method: 'POST', body: '{}' }),
+  generatedMediaImageUrl: (id: string) => `${baseUrl.replace(/\/$/, '')}/media/image-generations/${id}/content`,
   uploadMediaAsset: (file: File, provenance = 'Importado localmente', license = 'Sin verificar') =>
     request<{ asset: MediaAsset; duplicate: boolean }>('/media/assets', {
       method: 'PUT',
@@ -381,6 +582,11 @@ export const api = {
   cancelMediaJob: (id: string) => request<{ job: MediaJob }>(`/media/jobs/${id}/cancel`, { method: 'POST', body: '{}' }),
   retryMediaJob: (id: string) => request<{ job: MediaJob }>(`/media/jobs/${id}/retry`, { method: 'POST', body: '{}' }),
   mediaExports: () => request<MediaExport[]>('/media/exports'),
+  reviewMediaExport: (id: string, status: 'approved' | 'needs_changes') =>
+    request<{ export: MediaExport }>(`/media/exports/${id}/visual-review`, {
+      method: 'POST',
+      body: JSON.stringify({ status }),
+    }),
 };
 
 export function localDateTime(value: string | null) {
@@ -408,5 +614,14 @@ export const statusLabels: Record<PostStatus, string> = {
 
 export function formatDate(value: string | null, options: Intl.DateTimeFormatOptions = {}) {
   if (!value) return 'Sin fecha';
-  return new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', ...options }).format(new Date(value));
+  const dateParts = ['weekday', 'era', 'year', 'month', 'day'];
+  const timeParts = ['dayPeriod', 'hour', 'minute', 'second', 'fractionalSecondDigits', 'timeZoneName', 'timeStyle'];
+  const hasDatePart = dateParts.some((key) => key in options);
+  const hasTimePart = timeParts.some((key) => key in options);
+  const formatOptions: Intl.DateTimeFormatOptions = !hasDatePart && hasTimePart
+    ? { year: 'numeric', month: 'short', day: 'numeric', ...options }
+    : hasDatePart || hasTimePart
+      ? options
+      : { dateStyle: 'medium', ...options };
+  return new Intl.DateTimeFormat('es-MX', formatOptions).format(new Date(value));
 }

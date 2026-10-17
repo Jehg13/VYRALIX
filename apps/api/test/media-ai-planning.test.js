@@ -63,6 +63,7 @@ test('Media Studio genera, revisa, cancela, persiste y renderiza un plan IA aisl
   const originalDatabasePath = process.env.VYRALIX_DB_PATH;
   process.env.VYRALIX_DB_PATH = join(directory, 'media-plan.sqlite');
   const { db, dbPath, closeDatabase } = await import('../src/db.js');
+  db.prepare('UPDATE automation_settings SET external_operations_enabled = 1 WHERE id = 1').run();
   const { createProviderRouter } = await import('../src/ai/provider-router.js');
   const { createApp } = await import('../src/app.js');
   const responses = [];
@@ -179,14 +180,14 @@ test('Media Studio genera, revisa, cancela, persiste y renderiza un plan IA aisl
     const originalScenes = projectResult.body.project.scenes;
     assert.ok(originalScenes.length > 0);
 
-    responses.push('not JSON', planResponse());
+    responses.push(planResponse());
     const previewResult = await json(`/media/projects/${projectId}/plan`, {
       method: 'POST',
       body: JSON.stringify({ settings }),
     });
     assert.equal(previewResult.response.status, 200, previewResult.body.error);
     assert.equal(previewResult.body.provider, 'ollama');
-    assert.equal(previewResult.body.attempts, 2);
+    assert.equal(previewResult.body.attempts, 1);
     assert.equal(previewResult.body.plan.scenes.length, 2);
     assert.equal(previewResult.body.plan.scenes.reduce((sum, scene) => sum + scene.durationSeconds, 0), 10);
     assert.equal(previewResult.body.plan.scenes[0].order, 0);
@@ -194,7 +195,6 @@ test('Media Studio genera, revisa, cancela, persiste y renderiza un plan IA aisl
     let persisted = await json(`/media/projects/${projectId}`);
     assert.equal(persisted.body.scenes.length, originalScenes.length);
     assert.equal(persisted.body.aiPlan, null);
-    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM ai_provider_attempts WHERE task = 'media_planning' AND error_code = 'response_invalid'").get().count, 1);
 
     responses.push(regeneratedResponse());
     const regenerateResult = await json(`/media/projects/${projectId}/plan/scenes/0/regenerate`, {
@@ -217,6 +217,7 @@ test('Media Studio genera, revisa, cancela, persiste y renderiza un plan IA aisl
     });
     assert.equal(invalidResult.response.status, 502);
     assert.match(invalidResult.body.error, /inválida|incompleta/i);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM ai_provider_attempts WHERE task = 'media_planning' AND error_code = 'response_invalid'").get().count, 1);
     persisted = await json(`/media/projects/${projectId}`);
     assert.equal(persisted.body.aiPlan, null);
     assert.equal(persisted.body.scenes.length, originalScenes.length);
@@ -321,9 +322,38 @@ test('Media Studio genera, revisa, cancela, persiste y renderiza un plan IA aisl
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
       assert.equal(job.status, 'completed', job.error || job.stage);
+      assert.match(job.stage, /revisión visual pendiente/u);
       const exportList = await json('/media/exports');
       const exported = exportList.body.find((item) => item.projectId === projectId);
       assert.ok(exported);
+      assert.equal(exported.technicalValidationStatus, 'ffprobe_passed');
+      assert.equal(exported.visualReviewStatus, 'pending');
+      assert.equal(exported.visualReviewedAt, null);
+      assert.equal((await json(`/media/exports/${exported.id}/visual-review`, {
+        method: 'POST',
+        body: JSON.stringify({ status: 'not-a-review' }),
+      })).response.status, 400);
+      const approvedReview = await json(`/media/exports/${exported.id}/visual-review`, {
+        method: 'POST',
+        body: JSON.stringify({ status: 'approved', note: 'Inspección manual de la exportación aislada.' }),
+      });
+      assert.equal(approvedReview.response.status, 200, approvedReview.body.error);
+      assert.equal(approvedReview.body.export.visualReviewStatus, 'approved');
+      assert.ok(approvedReview.body.export.visualReviewedAt);
+      assert.equal(approvedReview.body.export.visualReviewNote, 'Inspección manual de la exportación aislada.');
+      const needsChangesReview = await json(`/media/exports/${exported.id}/visual-review`, {
+        method: 'POST',
+        body: JSON.stringify({ status: 'needs_changes' }),
+      });
+      assert.equal(needsChangesReview.response.status, 200, needsChangesReview.body.error);
+      assert.equal(needsChangesReview.body.export.visualReviewStatus, 'needs_changes');
+      assert.equal(needsChangesReview.body.export.visualReviewNote, null);
+      const reapprovedReview = await json(`/media/exports/${exported.id}/visual-review`, {
+        method: 'POST',
+        body: JSON.stringify({ status: 'approved' }),
+      });
+      assert.equal(reapprovedReview.response.status, 200, reapprovedReview.body.error);
+      assert.equal(reapprovedReview.body.export.visualReviewStatus, 'approved');
       const mp4Path = join(dirname(dbPath), 'media', 'exports', `${jobId}.mp4`);
       const probeResult = await execFileAsync(ffprobePath(), [
         '-v', 'error', '-show_entries', 'format=format_name,duration,size:stream=codec_type,codec_name,width,height',
@@ -338,6 +368,25 @@ test('Media Studio genera, revisa, cancela, persiste y renderiza un plan IA aisl
       assert.equal(exported.videoCodec, 'h264');
       const saved = await json(`/media/projects/${projectId}`);
       assert.ok(saved.body.scenes.every((scene) => !scene.visualPending && scene.asset));
+
+      const secondRender = await json(`/media/projects/${projectId}/render`, { method: 'POST', body: '{}' });
+      assert.equal(secondRender.response.status, 202, secondRender.body.error);
+      const secondJobId = secondRender.body.job.id;
+      const secondDeadline = Date.now() + 120_000;
+      let secondJob;
+      while (Date.now() < secondDeadline) {
+        const current = await json(`/media/jobs/${secondJobId}`);
+        assert.equal(current.response.status, 200);
+        secondJob = current.body;
+        if (['completed', 'failed', 'cancelled'].includes(secondJob.status)) break;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      assert.equal(secondJob.status, 'completed', secondJob.error || secondJob.stage);
+      const exportsAfterSecondRender = (await json('/media/exports')).body.filter((item) => item.projectId === projectId);
+      assert.equal(exportsAfterSecondRender.length, 2);
+      assert.equal(exportsAfterSecondRender.find((item) => item.id === exported.id).visualReviewStatus, 'approved');
+      const newExport = exportsAfterSecondRender.find((item) => item.id !== exported.id);
+      assert.equal(newExport.visualReviewStatus, 'pending');
     });
   } finally {
     await service.shutdown();
